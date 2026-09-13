@@ -6,12 +6,11 @@
 
 set -e
 
-# Directorios y rutas por defecto
 VM_DIR="/var/lib/libvirt/images"
 ISO_SEARCH_DIR="$HOME"
 TMP_XML=""
+TMP_OVA_DIR=""
 
-# Lista de paquetes del sistema necesarios
 REQUIRED_PACKAGES=(
     "qemu-desktop"
     "libvirt"
@@ -20,25 +19,24 @@ REQUIRED_PACKAGES=(
     "edk2-ovmf"
     "fzf"
     "gawk"
+    "tar"
 )
 
-# ==============================================================================
-#  Trap de Limpieza y Salida
-# ==============================================================================
 cleanup() {
-    # Restaurar cursor por si fzf o una interrupción lo ocultó
     tput cnorm 2>/dev/null || true
     
-    # Eliminar XML temporal si existe
     if [[ -n "$TMP_XML" && -f "$TMP_XML" ]]; then
         rm -f "$TMP_XML"
     fi
+
+    # Eliminar directorio temporal de extracción OVA si existe
+    if [[ -n "$TMP_OVA_DIR" && -d "$TMP_OVA_DIR" ]]; then
+        rm -rf "$TMP_OVA_DIR"
+    fi
 }
 
-# Capturar Ctrl+C (SIGINT), SIGTERM y la salida del script (EXIT)
 trap 'cleanup' EXIT SIGINT SIGTERM
 
-# Función para mostrar el logo
 show_logo() {
     clear
     echo -e "\e[36m"
@@ -53,9 +51,6 @@ EOF
     echo -e "\e[33m         -- CLI Interactive VM Builder for Pentesting --\e[0m\n"
 }
 
-# ==============================================================================
-#  Módulo de comprobación e instalación de dependencias
-# ==============================================================================
 check_and_install_dependencies() {
     echo -e "\e[34m[+] Comprobando dependencias del sistema...\e[0m"
     local MISSING_PACKAGES=()
@@ -87,21 +82,17 @@ check_and_install_dependencies() {
         echo -e "\e[32m[✓] Todos los paquetes necesarios están instalados.\e[0m\n"
     fi
 
-    # Verificar que el servicio libvirtd esté activo
     if ! systemctl is-active --quiet libvirtd; then
         echo -e "\e[33m[!] El servicio libvirtd no está activo. Iniciando...\e[0m"
         sudo systemctl enable --now libvirtd.service
     fi
 }
 
-# ==============================================================================
-#  Módulo: Crear Nueva VM
-# ==============================================================================
 create_vm() {
     show_logo
     echo -e "\e[33m--- Creación de Nueva Máquina Virtual ---\e[0m\n"
 
-    # 1. Nombre de la máquina virtual
+    # 1. Nombre de la VM
     read -rp "--> Introduce el nombre de la VM: " VM_NAME
     if [[ -z "$VM_NAME" ]]; then
         echo -e "\e[31m[!] El nombre no puede estar vacío.\e[0m"
@@ -109,18 +100,18 @@ create_vm() {
         return
     fi
 
-    # 2. Buscar imagen ISO usando fzf
-    echo -e "\n\e[34m[+] Buscando archivos .iso en $ISO_SEARCH_DIR...\e[0m"
-    ISO_PATH=$(find "$ISO_SEARCH_DIR" -type f -name "*.iso" 2>/dev/null | fzf --prompt="Selecciona la ISO de instalación: ")
+    # 2. Buscar archivos .iso O .ova usando fzf
+    echo -e "\n\e[34m[+] Buscando archivos .iso y .ova en $ISO_SEARCH_DIR...\e[0m"
+    IMAGE_PATH=$(find "$ISO_SEARCH_DIR" -type f \( -name "*.iso" -o -name "*.ova" \) 2>/dev/null | fzf --prompt="Selecciona la ISO u OVA: ")
 
-    if [[ -z "$ISO_PATH" ]]; then
-        echo -e "\e[31m[!] No se seleccionó ninguna ISO.\e[0m"
+    if [[ -z "$IMAGE_PATH" ]]; then
+        echo -e "\e[31m[!] No se seleccionó ninguna imagen.\e[0m"
         read -rp "Presiona Enter para continuar..."
         return
     fi
-    echo -e "\e[32m[✓] ISO Seleccionada:\e[0m $ISO_PATH"
+    echo -e "\e[32m[✓] Imagen seleccionada:\e[0m $IMAGE_PATH"
 
-    # 3. Asignación de RAM (en MB)
+    # 3. Asignación de RAM
     read -rp "--> Memoria RAM en MB [Por defecto: 2048]: " VM_RAM
     VM_RAM=${VM_RAM:-2048}
 
@@ -128,17 +119,19 @@ create_vm() {
     read -rp "--> Número de vCPUs [Por defecto: 2]: " VM_CPUS
     VM_CPUS=${VM_CPUS:-2}
 
-    # 5. Tamaño del disco duro (en GB)
-    read -rp "--> Tamaño del disco qcow2 en GB [Por defecto: 20]: " DISK_SIZE
-    DISK_SIZE=${DISK_SIZE:-20}
+    # Si es ISO solicitamos el tamaño de disco nuevo; si es OVA se auto-convertirá el existente
+    if [[ "$IMAGE_PATH" == *.iso ]]; then
+        read -rp "--> Tamaño del disco qcow2 en GB [Por defecto: 20]: " DISK_SIZE
+        DISK_SIZE=${DISK_SIZE:-20}
+    fi
 
-    # 6. Selección del tipo de red usando fzf
+    # 5. Modo de red
     echo -e "\n\e[34m[+] Selecciona el modo de red:\e[0m"
     NET_TYPE=$(echo -e "Bridge (Macvtap directo a la interfaz del Host)\nNAT (Red predeterminada de Libvirt)\nAislada (Host-Only)" | fzf --prompt="Tipo de Red: ")
 
     case "$NET_TYPE" in
         *"Bridge"*)
-            echo -e "\n\e[34m[+] Selecciona la interfaz física de red para el Bridge:\e[0m"
+            echo -e "\n\e[34m[+] Selecciona la interfaz física para el Bridge:\e[0m"
             PHYS_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | fzf --prompt="Interfaz física: ")
             if [[ -z "$PHYS_IFACE" ]]; then
                 echo -e "\e[31m[!] No se seleccionó interfaz.\e[0m"
@@ -169,18 +162,17 @@ create_vm() {
             ;;
     esac
 
-    # 7. Resumen de configuración
+    # Resumen
     show_logo
     echo -e "\e[33m=== Resumen de Configuración ===\e[0m"
     echo -e "Nombre VM  : $VM_NAME"
     echo -e "RAM        : ${VM_RAM} MB"
     echo -e "vCPUs      : $VM_CPUS"
-    echo -e "Disco      : ${DISK_SIZE} GB ($VM_DIR/${VM_NAME}.qcow2)"
+    echo -e "Origen     : $IMAGE_PATH"
     echo -e "Red        : $NET_TYPE"
-    echo -e "ISO        : $ISO_PATH"
     echo -e "================================\n"
 
-    read -rp "¿Deseas crear y lanzar la máquina virtual? (S/n): " CONFIRM
+    read -rp "¿Deseas procesar y lanzar la máquina virtual? (S/n): " CONFIRM
     CONFIRM=${CONFIRM:-S}
     if [[ ! "$CONFIRM" =~ ^[Ss]$ ]]; then
         echo -e "\e[31m[!] Operación cancelada.\e[0m"
@@ -188,14 +180,45 @@ create_vm() {
         return
     fi
 
-    # --- Proceso de Creación ---
     DISCO_PATH="$VM_DIR/${VM_NAME}.qcow2"
     TMP_XML="/tmp/${VM_NAME}.xml"
-
     sudo mkdir -p "$VM_DIR"
 
-    echo -e "\n\e[34m[+] Creando disco virtual qcow2...\e[0m"
-    sudo qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
+    # --- Procesamiento del archivo (ISO vs OVA) ---
+    if [[ "$IMAGE_PATH" == *.ova ]]; then
+        echo -e "\n\e[34m[+] Archivo OVA detectado. Descomprimiendo...\e[0m"
+        TMP_OVA_DIR=$(mktemp -d -t qemu4me-ova-XXXXXX)
+        tar -xvf "$IMAGE_PATH" -C "$TMP_OVA_DIR"
+
+        VMDK_FILE=$(find "$TMP_OVA_DIR" -type f -name "*.vmdk" | head -n 1)
+
+        if [[ -z "$VMDK_FILE" ]]; then
+            echo -e "\e[31m[!] No se encontró ningún disco .vmdk dentro del paquete .ova.\e[0m"
+            read -rp "Presiona Enter para continuar..."
+            return
+        fi
+
+        echo -e "\e[34m[+] Convirtiendo disco VMDK a QCOW2 nativo...\e[0m"
+        sudo qemu-img convert -f vmdk -O qcow2 "$VMDK_FILE" "$DISCO_PATH"
+
+        # Limpiar temporal OVA
+        rm -rf "$TMP_OVA_DIR"
+        TMP_OVA_DIR=""
+
+        # XML para disco ya preparado (sin ISO/CDROM)
+        CDROM_XML=""
+        BOOT_DEVS="<boot dev='hd'/>"
+    else
+        echo -e "\n\e[34m[+] Creando disco virtual blanco de ${DISK_SIZE}GB...\e[0m"
+        sudo qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
+
+        CDROM_XML="<disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${IMAGE_PATH}'/>
+      <target dev='hdb' bus='ide'/>
+    </disk>"
+        BOOT_DEVS="<boot dev='cdrom'/><boot dev='hd'/>"
+    fi
 
     RAM_KIB=$((VM_RAM * 1024))
 
@@ -206,8 +229,7 @@ create_vm() {
   <vcpu placement='static'>${VM_CPUS}</vcpu>
   <os>
     <type arch='x86_64' machine='pc'>hvm</type>
-    <boot dev='cdrom'/>
-    <boot dev='hd'/>
+    ${BOOT_DEVS}
   </os>
   <features>
     <acpi/>
@@ -220,11 +242,7 @@ create_vm() {
       <source file='${DISCO_PATH}'/>
       <target dev='vda' bus='virtio'/>
     </disk>
-    <disk type='file' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source file='${ISO_PATH}'/>
-      <target dev='hdb' bus='ide'/>
-    </disk>
+    ${CDROM_XML}
     ${NET_XML}
     <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
     <console type='pty'/>
@@ -240,19 +258,15 @@ EOF
     echo -e "\e[34m[+] Arrancando la VM ${VM_NAME}...\e[0m"
     sudo virsh start "$VM_NAME"
 
-    echo -e "\n\e[32m[✓] ¡Máquina virtual '${VM_NAME}' creada y lanzada correctamente!\e[0m"
+    echo -e "\n\e[32m[✓] ¡Máquina virtual '${VM_NAME}' procesada y lanzada correctamente!\e[0m"
     echo -e "Puerto VNC asignado: \e[36msudo virsh vncdisplay ${VM_NAME}\e[0m"
     read -rp "Presiona Enter para volver al menú..."
 }
 
-# ==============================================================================
-#  Módulo: Gestionar VMs Existentes
-# ==============================================================================
 manage_vms() {
     show_logo
     echo -e "\e[33m--- Gestión de Máquinas Virtuales ---\e[0m\n"
 
-    # Obtener lista de VMs registradas
     VMS=$(sudo virsh list --all --name | grep -v '^$')
 
     if [[ -z "$VMS" ]]; then
@@ -301,15 +315,12 @@ manage_vms() {
     read -rp "Presiona Enter para continuar..."
 }
 
-# ==============================================================================
-#  Bucle del Menú Principal
-# ==============================================================================
 main_menu() {
     check_and_install_dependencies
 
     while true; do
         show_logo
-        MENU_OPTION=$(echo -e "1. Crear nueva VM\n2. Gestionar / Listar VMs\n3. Salir" | fzf --prompt="Selecciona una opción: ")
+        MENU_OPTION=$(echo -e "1. Crear nueva VM (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Salir" | fzf --prompt="Selecciona una opción: ")
 
         case "$MENU_OPTION" in
             1*)
@@ -330,5 +341,4 @@ main_menu() {
     done
 }
 
-# Ejecutar menú principal
 main_menu
