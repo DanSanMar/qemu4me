@@ -90,7 +90,6 @@ check_and_install_dependencies() {
             ;;
     esac
 
-    # Comprobar si /etc/qemu/bridge.conf existe para evitar errores en modo bridge
     if [[ ! -f /etc/qemu/bridge.conf ]]; then
         echo -e "\e[33m[!] Configurando /etc/qemu/bridge.conf para el modo bridge...\e[0m"
         sudo mkdir -p /etc/qemu
@@ -98,7 +97,6 @@ check_and_install_dependencies() {
         sudo chmod 640 /etc/qemu/bridge.conf
     fi
 
-    # Cargar módulo KVM
     if ! lsmod | grep -q kvm; then
         sudo modprobe kvm 2>/dev/null || true
         sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
@@ -106,7 +104,6 @@ check_and_install_dependencies() {
 }
 
 get_bridge_interfaces() {
-    # Lista interfaces físicas/virtuales tipo bridge activas en el sistema
     ip -d link show type bridge | grep -E '^[0-9]+:' | awk -F': ' '{print $2}'
 }
 
@@ -139,29 +136,42 @@ create_vm() {
     read -rp "--> Memoria RAM en MB [2048]: " VM_RAM; VM_RAM=${VM_RAM:-2048}
     read -rp "--> vCPUs [2]: " VM_CPUS; VM_CPUS=${VM_CPUS:-2}
 
-    DISCO_PATH="$VM_STORAGE_DIR/${VM_NAME}.qcow2"
+    DRIVE_ARGS=""
+    CDROM_ARG=""
 
     if [[ "$IMAGE_PATH" == *.ova ]]; then
-        echo -e "\n\e[34m[+] Extrayendo paquete OVA...\e[0m"
+        echo -e "\n\e[34m[+] Extrayendo paquete OVA multi-disco...\e[0m"
         TMP_OVA_DIR=$(mktemp -d -t qemu4me-ova-XXXXXX)
         tar -xvf "$IMAGE_PATH" -C "$TMP_OVA_DIR"
 
-        VMDK_FILE=$(find "$TMP_OVA_DIR" -type f -name "*.vmdk" | head -n 1)
-        if [[ -z "$VMDK_FILE" ]]; then
-            echo -e "\e[31m[!] No se encontró ningún disco .vmdk en el OVA.\e[0m"
+        mapfile -t VMDK_FILES < <(find "$TMP_OVA_DIR" -type f -name "*.vmdk" | sort)
+        if [ ${#VMDK_FILES[@]} -eq 0 ]; then
+            echo -e "\e[31m[!] No se encontraron discos .vmdk en el OVA.\e[0m"
             read -rp "Presiona Enter..."
             return
         fi
 
-        echo -e "\e[34m[+] Convirtiendo VMDK a QCOW2...\e[0m"
-        qemu-img convert -f vmdk -O qcow2 "$VMDK_FILE" "$DISCO_PATH"
+        echo -e "\e[34m[+] Procesando y convirtiendo ${#VMDK_FILES[@]} disco(s) VMDK a QCOW2...\e[0m"
+        for idx in "${!VMDK_FILES[@]}"; do
+            vmdk="${VMDK_FILES[$idx]}"
+            if [ "$idx" -eq 0 ]; then
+                target_qcow2="$VM_STORAGE_DIR/${VM_NAME}.qcow2"
+            else
+                target_qcow2="$VM_STORAGE_DIR/${VM_NAME}-disk${idx}.qcow2"
+            fi
+            echo -e "  └─ Convirtiendo ($((idx+1))/${#VMDK_FILES[@]}): $(basename "$vmdk") -> $(basename "$target_qcow2")"
+            qemu-img convert -f vmdk -O qcow2 "$vmdk" "$target_qcow2"
+            DRIVE_ARGS+="-drive file=\"$target_qcow2\",if=virtio,format=qcow2 "
+        done
+
         rm -rf "$TMP_OVA_DIR"
         TMP_OVA_DIR=""
-        CDROM_ARG=""
     else
+        DISCO_PATH="$VM_STORAGE_DIR/${VM_NAME}.qcow2"
         read -rp "--> Tamaño del disco en GB [20]: " DISK_SIZE; DISK_SIZE=${DISK_SIZE:-20}
         echo -e "\e[34m[+] Creando disco QCOW2 blanco...\e[0m"
         qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
+        DRIVE_ARGS="-drive file=\"$DISCO_PATH\",if=virtio,format=qcow2"
         CDROM_ARG="-cdrom \"$IMAGE_PATH\" -boot order=d"
     fi
 
@@ -171,7 +181,7 @@ create_vm() {
 
     if [[ -z "$BRIDGES" ]]; then
         echo -e "\e[33m[!] No se detectaron interfaces 'bridge' activas en el sistema.\e[0m"
-        echo -e "\e[33m[!] Creando un puerto puente por defecto 'br0' temporal con iproute2...\e[0m"
+        echo -e "\e[33m[!] Creando puerto puente por defecto 'br0' temporal con iproute2...\e[0m"
         sudo ip link add name br0 type bridge
         sudo ip link set dev br0 up
         SELECTED_BRIDGE="br0"
@@ -185,26 +195,43 @@ create_vm() {
         return
     fi
 
-    # Argumentos de red QEMU Bridge
-    # Se añade una dirección MAC aleatoria única para evitar colisiones en la subred
     RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
     NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
 
-    # Guardar script de arranque de la VM
+    # Selección del modo de pantalla / gráficos por defecto
+    echo -e "\n\e[34m[+] Configuración de Salida de Video/Pantalla:\e[0m"
+    DISPLAY_CHOICE=$(echo -e "Default GTK/SDL GUI (-display default)\nHeadless / Sin GUI (-display none)\nVNC Server :1 (-vnc :1)" | fzf --prompt="Selecciona el modo de pantalla: ")
+
+    case "$DISPLAY_CHOICE" in
+        *"Headless"*) DEFAULT_DISPLAY="-display none" ;;
+        *"VNC"*)      DEFAULT_DISPLAY="-vnc :1" ;;
+        *)            DEFAULT_DISPLAY="-display default" ;;
+    esac
+
     VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
     cat <<EOF > "$VM_SCRIPT"
 #!/usr/bin/env bash
-qemu-system-x86_64 \\
+
+# Procesamiento de flags de ejecución
+DISPLAY_OPT="$DEFAULT_DISPLAY"
+for arg in "\$@"; do
+    case \$arg in
+        --vnc) DISPLAY_OPT="-vnc :1" ;;
+        --headless) DISPLAY_OPT="-display none" ;;
+        --gui) DISPLAY_OPT="-display default" ;;
+    esac
+done
+
+exec qemu-system-x86_64 \\
     -enable-kvm \\
     -name "$VM_NAME" \\
     -m $VM_RAM \\
     -smp $VM_CPUS \\
-    -drive file="$DISCO_PATH",if=virtio,format=qcow2 \\
+    $DRIVE_ARGS \\
     $CDROM_ARG \\
     $NET_ARGS \\
     -vga virtio \\
-    -display default \\
-    "\$@"
+    \$DISPLAY_OPT
 EOF
 
     chmod +x "$VM_SCRIPT"
@@ -219,6 +246,68 @@ EOF
         echo -e "\e[32m[+] Proceso QEMU ejecutándose en segundo plano.\e[0m"
     fi
     read -rp "Presiona Enter para continuar..."
+}
+
+manage_snapshots() {
+    local vm_name="$1"
+    local primary_disk="$VM_STORAGE_DIR/${vm_name}.qcow2"
+
+    if [[ ! -f "$primary_disk" ]]; then
+        echo -e "\e[31m[!] No se encontró el disco principal para instantáneas: $primary_disk\e[0m"
+        read -rp "Presiona Enter..."
+        return
+    fi
+
+    while true; do
+        show_logo
+        echo -e "\e[33m--- Gestión de Snapshots: $vm_name ---\e[0m\n"
+        
+        SNAP_ACTION=$(echo -e "1. Crear Snapshot\n2. Listar Snapshots\n3. Restaurar Snapshot\n4. Eliminar Snapshot\n5. Volver" | fzf --prompt="Selecciona acción de Snapshot: ")
+
+        case "$SNAP_ACTION" in
+            1*)
+                read -rp "--> Nombre del Snapshot: " RAW_SNAP
+                SNAP_NAME=$(echo "$RAW_SNAP" | tr -cd 'a-zA-Z0-9_-')
+                if [[ -n "$SNAP_NAME" ]]; then
+                    qemu-img snapshot -c "$SNAP_NAME" "$primary_disk"
+                    echo -e "\e[32m[✓] Snapshot '$SNAP_NAME' creado correctamente.\e[0m"
+                fi
+                read -rp "Presiona Enter..."
+                ;;
+            2*)
+                echo -e "\e[34m[+] Instantáneas en $primary_disk:\e[0m"
+                qemu-img snapshot -l "$primary_disk" || echo "Sin snapshots."
+                read -rp "Presiona Enter..."
+                ;;
+            3*)
+                mapfile -t SNAPS < <(qemu-img snapshot -l "$primary_disk" | tail -n +3 | awk '{print $2}')
+                if [ ${#SNAPS[@]} -eq 0 ]; then
+                    echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
+                else
+                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Snapshot a restaurar: ")
+                    if [[ -n "$TARGET_SNAP" ]]; then
+                        qemu-img snapshot -a "$TARGET_SNAP" "$primary_disk"
+                        echo -e "\e[32m[✓] Disco restaurado al snapshot '$TARGET_SNAP'.\e[0m"
+                    fi
+                fi
+                read -rp "Presiona Enter..."
+                ;;
+            4*)
+                mapfile -t SNAPS < <(qemu-img snapshot -l "$primary_disk" | tail -n +3 | awk '{print $2}')
+                if [ ${#SNAPS[@]} -eq 0 ]; then
+                    echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
+                else
+                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Snapshot a eliminar: ")
+                    if [[ -n "$TARGET_SNAP" ]]; then
+                        qemu-img snapshot -d "$TARGET_SNAP" "$primary_disk"
+                        echo -e "\e[31m[✓] Snapshot '$TARGET_SNAP' eliminado.\e[0m"
+                    fi
+                fi
+                read -rp "Presiona Enter..."
+                ;;
+            *) break ;;
+        esac
+    done
 }
 
 manage_vms() {
@@ -246,16 +335,23 @@ manage_vms() {
     fi
 
     echo -e "Estado de $SELECTED_VM: $STATUS\n"
-    ACTION=$(echo -e "Arrancar (Start)\nApagar Forzado (Kill)\nEliminar VM (Borrar Script + Disco)\nVolver" | fzf --prompt="Acción [$SELECTED_VM]: ")
+    ACTION=$(echo -e "Arrancar (GUI)\nArrancar (VNC Server :1)\nArrancar (Headless / Sin GUI)\nGestionar Snapshots\nApagar Forzado (Kill)\nEliminar VM (Script + Discos)\nVolver" | fzf --prompt="Acción [$SELECTED_VM]: ")
 
     case "$ACTION" in
-        *"Arrancar"*)
-            if pgrep -f "qemu-system-x86_64.*-name $SELECTED_VM" > /dev/null; then
-                echo -e "\e[33m[!] La VM ya está en ejecución.\e[0m"
-            else
-                "$VM_CONFIG_DIR/${SELECTED_VM}.sh" &
-                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en segundo plano.\e[0m"
-            fi
+        *"Arrancar (GUI)"*)
+            "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --gui &
+            echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada con GUI.\e[0m"
+            ;;
+        *"Arrancar (VNC"*)
+            "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --vnc &
+            echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en modo VNC (Puerto 5901 / :1).\e[0m"
+            ;;
+        *"Arrancar (Headless"*)
+            "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --headless &
+            echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en segundo plano (Headless).\e[0m"
+            ;;
+        *"Snapshots"*)
+            manage_snapshots "$SELECTED_VM"
             ;;
         *"Apagar"*)
             if pkill -f "qemu-system-x86_64.*-name $SELECTED_VM"; then
@@ -265,12 +361,12 @@ manage_vms() {
             fi
             ;;
         *"Eliminar"*)
-            read -rp "¿Confirmas eliminar '$SELECTED_VM' y su disco permanentemente? (s/N): " CONF
+            read -rp "¿Confirmas eliminar '$SELECTED_VM' y TODOS sus discos asociados? (s/N): " CONF
             if [[ "$CONF" =~ ^[Ss]$ ]]; then
                 pkill -f "qemu-system-x86_64.*-name $SELECTED_VM" 2>/dev/null || true
                 rm -f "$VM_CONFIG_DIR/${SELECTED_VM}.sh"
-                rm -f "$VM_STORAGE_DIR/${SELECTED_VM}.qcow2"
-                echo -e "\e[31m[✓] VM eliminada.\e[0m"
+                rm -f "$VM_STORAGE_DIR/${SELECTED_VM}"*.qcow2
+                echo -e "\e[31m[✓] VM y discos asociados eliminados.\e[0m"
             fi
             ;;
     esac
