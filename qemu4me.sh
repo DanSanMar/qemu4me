@@ -414,26 +414,28 @@ quick_access_menu() {
     local fwd_rules
     fwd_rules=$(grep -oE 'hostfwd=[^ "']+' "$script_path" | cut -d'=' -f2 || true)
 
-    local ACTIONS=()
+    local labels=()
+    local cmds=()
+
     if [[ -n "$fwd_rules" ]]; then
         while IFS= read -r rule; do
             local hport
             hport=$(echo "$rule" | cut -d':' -f3 | cut -d'-' -f1)
-            ACTIONS+=("Copiar comando SSH (Puerto Host $hport)|ssh user@127.0.0.1 -p $hport")
+            labels+=("Copiar comando SSH (Puerto Host $hport)")
+            cmds+=("ssh user@127.0.0.1 -p $hport")
         done <<< "$fwd_rules"
     fi
-    ACTIONS+=("Copiar comando de ejecucion QEMU direct|$script_path")
-    ACTIONS+=("Volver|")
+
+    labels+=("Copiar comando de ejecucion QEMU directo")
+    cmds+=("$script_path")
 
     local CHOICE
-    CHOICE=$(printf "%s\n" "${ACTIONS[@]}" | cut -d'|' -f1 | fzf --prompt="Selecciona Acción Rápida: ")
-    [[ -z "$CHOICE" || "$CHOICE" == "Volver" ]] && return
+    CHOICE=$(printf "%s\n" "${labels[@]}" | fzf --prompt="Selecciona Acción Rápida: ")
+    [[ -z "$CHOICE" ]] && return
 
-    for entry in "${ACTIONS[@]}"; do
-        if [[ "$entry" == "$CHOICE"* ]]; then
-            local cmd
-            cmd=$(echo "$entry" | cut -d'|' -f2)
-            copy_to_clipboard "$cmd"
+    for idx in "${!labels[@]}"; do
+        if [[ "${labels[$idx]}" == "$CHOICE" ]]; then
+            copy_to_clipboard "${cmds[$idx]}"
             read -rp "Presiona Enter..."
             return
         fi
