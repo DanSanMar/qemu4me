@@ -176,7 +176,6 @@ configure_network() {
         read -rp "--> Redirecciones de puerto hostfwd (Ej: tcp::2222-:22,tcp::8080-:80): " FWD_RULES
         local FWD_STR=""
         if [[ -n "$FWD_RULES" ]]; then
-            # Sanitización básica de la regla hostfwd
             FWD_RULES=$(echo "$FWD_RULES" | tr -cd 'a-zA-Z0-9_,-:')
             IFS=',' read -ra ADDR <<< "$FWD_RULES"
             for i in "${ADDR[@]}"; do
@@ -309,7 +308,6 @@ for arg in "\$@"; do
     esac
 done
 
-# Asignar permisos estrictos por defecto a la máscara de archivos/sockets
 umask 077
 
 exec qemu-system-x86_64 \\
@@ -341,9 +339,9 @@ show_vm_header() {
     echo -e "\e[1m  VM SELECCIONADA: \e[33m$vm_name\e[0m"
     
     local mac
-    mac=$(grep -oE 'mac=[0-9A-Fa-f:]+' "$script_path" | cut -d'=' -f2 || echo "Desconocida")
+    mac=$(grep -o -E 'mac=[0-9A-Fa-f:]+' "$script_path" | cut -d'=' -f2 || echo "Desconocida")
     local hostfwd
-    hostfwd=$(grep -oE 'hostfwd=[^ "']+' "$script_path" | tr '\n' ' ' || echo "Ninguno")
+    hostfwd=$(grep -o -E 'hostfwd=[^ ]+' "$script_path" | cut -d'=' -f2 | tr '\n' ' ' || echo "Ninguno")
 
     local disk_size="N/A"
     if [[ -f "$VM_STORAGE_DIR/${vm_name}.qcow2" ]]; then
@@ -412,7 +410,7 @@ quick_access_menu() {
     echo -e "\e[33m--- Atajos de Teclado y Acceso Rápido ---\e[0m\n"
 
     local fwd_rules
-    fwd_rules=$(grep -oE 'hostfwd=[^ "']+' "$script_path" | cut -d'=' -f2 || true)
+    fwd_rules=$(grep -o -E 'hostfwd=[^ ]+' "$script_path" | cut -d'=' -f2 || true)
 
     local labels=()
     local cmds=()
@@ -707,7 +705,7 @@ manage_vms() {
                     break
                 fi
                 ;;
-                *) break ;;
+            *) break ;;
         esac
     done
 }
