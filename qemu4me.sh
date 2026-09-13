@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-#  qemu4me - Gestor ultraligero de VMs con QEMU/KVM nativo (Sin libvirt/virt)
+#  qemu4me - Gestor ultraligero de VMs para Pentesting (QEMU Nativo + Bridge)
 # ==============================================================================
 
 set -eo pipefail
@@ -34,7 +34,7 @@ show_logo() {
  ╚██████╔╝███████╗██║ ╚═╝ ██║     ██║██║ ╚═╝ ██║███████╗
   ╚══▀▀═╝ ╚══════╝╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝╚══════╝
 EOF
-    echo -e "\e[33m         -- CLI VM Manager (Pure QEMU/KVM + fzf) --\e[0m\n"
+    echo -e "\e[33m         -- CLI VM Manager for Pentesting (Pure QEMU + Bridge) --\e[0m\n"
 }
 
 detect_distro() {
@@ -62,44 +62,57 @@ check_and_install_dependencies() {
 
     case "$DISTRO" in
         arch)
-            for pkg in qemu-desktop fzf gawk tar; do
+            for pkg in qemu-desktop fzf gawk tar iproute2; do
                 pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias con pacman...\e[0m"
+                echo -e "\e[34m[+] Instalando dependencias en Arch...\e[0m"
                 sudo pacman -S --needed --noconfirm "${MISSING[@]}"
             fi
             ;;
         fedora)
-            for pkg in qemu-kvm fzf gawk tar; do
+            for pkg in qemu-kvm fzf gawk tar iproute; do
                 rpm -q "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias con dnf...\e[0m"
+                echo -e "\e[34m[+] Instalando dependencias en Fedora...\e[0m"
                 sudo dnf install -y "${MISSING[@]}"
             fi
             ;;
         debian)
-            for pkg in qemu-system-x86 fzf gawk tar; do
+            for pkg in qemu-system-x86 fzf gawk tar iproute2; do
                 dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias con apt...\e[0m"
+                echo -e "\e[34m[+] Instalando dependencias en Debian/Ubuntu...\e[0m"
                 sudo apt-get update && sudo apt-get install -y "${MISSING[@]}"
             fi
             ;;
     esac
 
-    # Cargar módulo KVM si no está cargado
+    # Comprobar si /etc/qemu/bridge.conf existe para evitar errores en modo bridge
+    if [[ ! -f /etc/qemu/bridge.conf ]]; then
+        echo -e "\e[33m[!] Configurando /etc/qemu/bridge.conf para el modo bridge...\e[0m"
+        sudo mkdir -p /etc/qemu
+        echo "allow all" | sudo tee /etc/qemu/bridge.conf >/dev/null
+        sudo chmod 640 /etc/qemu/bridge.conf
+    fi
+
+    # Cargar módulo KVM
     if ! lsmod | grep -q kvm; then
         sudo modprobe kvm 2>/dev/null || true
         sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
     fi
 }
 
+get_bridge_interfaces() {
+    # Lista interfaces físicas/virtuales tipo bridge activas en el sistema
+    ip -d link show type bridge | grep -E '^[0-9]+:' | awk -F': ' '{print $2}'
+}
+
 create_vm() {
     show_logo
-    echo -e "\e[33m--- Creación de Nueva Máquina Virtual ---\e[0m\n"
+    echo -e "\e[33m--- Creación de Nueva Máquina Virtual (Pentesting) ---\e[0m\n"
 
     read -rp "--> Nombre de la VM: " RAW_NAME
     VM_NAME=$(echo "$RAW_NAME" | tr -cd 'a-zA-Z0-9_-')
@@ -152,15 +165,30 @@ create_vm() {
         CDROM_ARG="-cdrom \"$IMAGE_PATH\" -boot order=d"
     fi
 
-    # Configuración de Red Nativa QEMU
-    echo -e "\n\e[34m[+] Selecciona el modo de red:\e[0m"
-    NET_TYPE=$(echo -e "User NAT (Sin permisos root, recomendado)\nTAP Bridge (Requiere sudo y puente preconfigurado)" | fzf --prompt="Red: ")
+    # Configuración de Red Modo Bridge
+    echo -e "\n\e[34m[+] Configuración de Red para Pentesting:\e[0m"
+    BRIDGES=$(get_bridge_interfaces)
 
-    if [[ "$NET_TYPE" == *"TAP"* ]]; then
-        NET_ARGS="-netdev tap,id=net0,script=no,downscript=no -device virtio-net-pci,netdev=net0"
+    if [[ -z "$BRIDGES" ]]; then
+        echo -e "\e[33m[!] No se detectaron interfaces 'bridge' activas en el sistema.\e[0m"
+        echo -e "\e[33m[!] Creando un puerto puente por defecto 'br0' temporal con iproute2...\e[0m"
+        sudo ip link add name br0 type bridge
+        sudo ip link set dev br0 up
+        SELECTED_BRIDGE="br0"
     else
-        NET_ARGS="-netdev user,id=net0 -device virtio-net-pci,netdev=net0"
+        SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Selecciona la interfaz Bridge: ")
     fi
+
+    if [[ -z "$SELECTED_BRIDGE" ]]; then
+        echo -e "\e[31m[!] Selección de red cancelada.\e[0m"
+        read -rp "Presiona Enter..."
+        return
+    fi
+
+    # Argumentos de red QEMU Bridge
+    # Se añade una dirección MAC aleatoria única para evitar colisiones en la subred
+    RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+    NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
 
     # Guardar script de arranque de la VM
     VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
@@ -181,12 +209,14 @@ EOF
 
     chmod +x "$VM_SCRIPT"
 
-    echo -e "\n\e[32m[✓] ¡VM '$VM_NAME' configurada correctamente!\e[0m"
+    echo -e "\n\e[32m[✓] ¡VM '$VM_NAME' configurada en modo Bridge ($SELECTED_BRIDGE)!\e[0m"
+    echo -e "Dirección MAC asignada: \e[36m$RAND_MAC\e[0m"
+    
     read -rp "¿Deseas arrancarla ahora? (S/n): " START_NOW
     START_NOW=${START_NOW:-S}
     if [[ "$START_NOW" =~ ^[Ss]$ ]]; then
         "$VM_SCRIPT" &
-        echo -e "\e[32m[+] Procesos de QEMU iniciados en segundo plano.\e[0m"
+        echo -e "\e[32m[+] Proceso QEMU ejecutándose en segundo plano.\e[0m"
     fi
     read -rp "Presiona Enter para continuar..."
 }
@@ -209,9 +239,8 @@ manage_vms() {
     SELECTED_VM=$(printf "%s\n" "${VMS[@]}" | fzf --prompt="Selecciona una VM: ")
     [[ -z "$SELECTED_VM" ]] && return
 
-    # Verificar si la VM está ejecutándose
     if pgrep -f "qemu-system-x86_64.*-name $SELECTED_VM" > /dev/null; then
-        STATUS="\e[32m[EN EJECTUCIÓN]\e[0m"
+        STATUS="\e[32m[EN EJECUCIÓN]\e[0m"
     else
         STATUS="\e[31m[APAGADA]\e[0m"
     fi
@@ -225,7 +254,7 @@ manage_vms() {
                 echo -e "\e[33m[!] La VM ya está en ejecución.\e[0m"
             else
                 "$VM_CONFIG_DIR/${SELECTED_VM}.sh" &
-                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada.\e[0m"
+                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en segundo plano.\e[0m"
             fi
             ;;
         *"Apagar"*)
@@ -241,7 +270,7 @@ manage_vms() {
                 pkill -f "qemu-system-x86_64.*-name $SELECTED_VM" 2>/dev/null || true
                 rm -f "$VM_CONFIG_DIR/${SELECTED_VM}.sh"
                 rm -f "$VM_STORAGE_DIR/${SELECTED_VM}.qcow2"
-                echo -e "\e[31m[✓] VM y archivos asociados eliminados.\e[0m"
+                echo -e "\e[31m[✓] VM eliminada.\e[0m"
             fi
             ;;
     esac
@@ -252,7 +281,7 @@ main_menu() {
     check_and_install_dependencies
     while true; do
         show_logo
-        MENU_OPTION=$(echo -e "1. Crear nueva VM (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Salir" | fzf --prompt="Selecciona: ")
+        MENU_OPTION=$(echo -e "1. Crear nueva VM vulnerable (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Salir" | fzf --prompt="Selecciona: ")
         case "$MENU_OPTION" in
             1*) create_vm ;;
             2*) manage_vms ;;
