@@ -149,12 +149,33 @@ check_and_install_dependencies() {
             ;;
     esac
 
+    # Hardening & Configuración de Bridge Helper y ACLs
     if [[ ! -f /etc/qemu/bridge.conf ]]; then
         echo -e "\e[33m[!] Configurando /etc/qemu/bridge.conf para el modo bridge...\e[0m"
         sudo mkdir -p /etc/qemu
         echo "allow all" | sudo tee /etc/qemu/bridge.conf >/dev/null
         sudo chmod 640 /etc/qemu/bridge.conf
+    else
+        if ! grep -q "allow all" /etc/qemu/bridge.conf; then
+            echo -e "\e[33m[!] Añadiendo 'allow all' a /etc/qemu/bridge.conf...\e[0m"
+            echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
+        fi
     fi
+
+    local HELPER_PATHS=(
+        "/usr/lib/qemu/qemu-bridge-helper"
+        "/usr/libexec/qemu-bridge-helper"
+        "/usr/lib/qemu-kvm/qemu-bridge-helper"
+    )
+
+    for helper in "${HELPER_PATHS[@]}"; do
+        if [[ -f "$helper" ]]; then
+            if [[ ! -u "$helper" ]]; then
+                echo -e "\e[33m[!] Asignando permisos SUID a $helper...\e[0m"
+                sudo chmod u+s "$helper" 2>/dev/null || chmod 4755 "$helper" 2>/dev/null || true
+            fi
+        fi
+    done
 
     if ! lsmod | grep -q kvm; then
         sudo modprobe kvm 2>/dev/null || true
@@ -164,6 +185,91 @@ check_and_install_dependencies() {
 
 get_bridge_interfaces() {
     ip -d link show type bridge | grep -E '^[0-9]+:' | awk -F': ' '{print $2}'
+}
+
+get_vm_ip_address() {
+    local mac_addr="$1"
+    if [[ -z "$mac_addr" || "$mac_addr" == "Desconocida" ]]; then
+        echo "No detectada"
+        return
+    fi
+
+    local mac_lower
+    mac_lower=$(echo "$mac_addr" | tr '[:upper:]' '[:lower:]')
+    local ip_found=""
+
+    # Método 1: Búsqueda en IP Neighbor / ARP
+    ip_found=$(ip neighbor show | grep -i "$mac_lower" | awk '{print $1}' | head -n1)
+
+    # Método 2: Tablas de concesión DHCP locales (dnsmasq / NetworkManager / systemd-networkd)
+    if [[ -z "$ip_found" ]]; then
+        local lease_files=(
+            /var/lib/misc/dnsmasq.leases
+            /var/lib/dhcp/dhcpd.leases
+            /var/lib/NetworkManager/*.lease
+            /var/lib/systemd/network/*.lease
+        )
+        for lf in "${lease_files[@]}"; do
+            if [[ -f "$lf" ]]; then
+                ip_found=$(grep -i "$mac_lower" "$lf" 2>/dev/null | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+                [[ -n "$ip_found" ]] && break
+            fi
+        done
+    fi
+
+    if [[ -n "$ip_found" ]]; then
+        echo "$ip_found"
+    else
+        echo "No detectada (Offline/Buscando...)"
+    fi
+}
+
+select_ram() {
+    local CHOICE
+    CHOICE=$(echo -e "1024 MB (1GB)\n2048 MB (2GB)\n4096 MB (4GB)\n8192 MB (8GB)\nPersonalizado..." | fzf --prompt="Seleccione Memoria RAM: ")
+    case "$CHOICE" in
+        *"1024"*) echo "1024" ;;
+        *"2048"*) echo "2048" ;;
+        *"4096"*) echo "4096" ;;
+        *"8192"*) echo "8192" ;;
+        *)
+            read -rp "--> Introduce RAM personalizada en MB [2048]: " CUSTOM_RAM
+            CUSTOM_RAM=$(echo "$CUSTOM_RAM" | tr -cd '0-9')
+            echo "${CUSTOM_RAM:-2048}"
+            ;;
+    esac
+}
+
+select_cpus() {
+    local CHOICE
+    CHOICE=$(echo -e "1 CPU\n2 CPUs\n4 CPUs\n8 CPUs\nPersonalizado..." | fzf --prompt="Seleccione vCPUs: ")
+    case "$CHOICE" in
+        *"1 CPU"*) echo "1" ;;
+        *"2 CPUs"*) echo "2" ;;
+        *"4 CPUs"*) echo "4" ;;
+        *"8 CPUs"*) echo "8" ;;
+        *)
+            read -rp "--> Introduce vCPUs personalizadas [2]: " CUSTOM_CPUS
+            CUSTOM_CPUS=$(echo "$CUSTOM_CPUS" | tr -cd '0-9')
+            echo "${CUSTOM_CPUS:-2}"
+            ;;
+    esac
+}
+
+select_disk_size() {
+    local CHOICE
+    CHOICE=$(echo -e "10 GB (Ligero)\n20 GB (Estándar)\n40 GB (Medio)\n80 GB (Grande)\nPersonalizado..." | fzf --prompt="Seleccione Tamaño de Disco QCOW2: ")
+    case "$CHOICE" in
+        *"10 GB"*) echo "10" ;;
+        *"20 GB"*) echo "20" ;;
+        *"40 GB"*) echo "40" ;;
+        *"80 GB"*) echo "80" ;;
+        *)
+            read -rp "--> Introduce tamaño de disco en GB [20]: " CUSTOM_DISK
+            CUSTOM_DISK=$(echo "$CUSTOM_DISK" | tr -cd '0-9')
+            echo "${CUSTOM_DISK:-20}"
+            ;;
+    esac
 }
 
 configure_network() {
@@ -220,10 +326,8 @@ create_vm() {
         return
     fi
 
-    read -rp "--> Memoria RAM en MB [2048]: " VM_RAM; VM_RAM=${VM_RAM:-2048}
-    read -rp "--> vCPUs [2]: " VM_CPUS; VM_CPUS=${VM_CPUS:-2}
-    VM_RAM=$(echo "$VM_RAM" | tr -cd '0-9')
-    VM_CPUS=$(echo "$VM_CPUS" | tr -cd '0-9')
+    VM_RAM=$(select_ram)
+    VM_CPUS=$(select_cpus)
 
     DRIVE_ARGS=""
     CDROM_ARG=""
@@ -262,8 +366,7 @@ create_vm() {
         rm -rf "$TMP_OVA_DIR"
         TMP_OVA_DIR=""
     else
-        read -rp "--> Tamaño del disco en GB [20]: " DISK_SIZE; DISK_SIZE=${DISK_SIZE:-20}
-        DISK_SIZE=$(echo "$DISK_SIZE" | tr -cd '0-9')
+        DISK_SIZE=$(select_disk_size)
         local req_space=$(( DISK_SIZE * 1073741824 ))
         if ! check_free_space "$VM_STORAGE_DIR" "$req_space"; then
             read -rp "Presiona Enter..."
@@ -343,6 +446,9 @@ show_vm_header() {
     local hostfwd
     hostfwd=$(grep -o -E 'hostfwd=[^ ]+' "$script_path" | cut -d'=' -f2 | tr '\n' ' ' || echo "Ninguno")
 
+    local vm_ip
+    vm_ip=$(get_vm_ip_address "$mac")
+
     local disk_size="N/A"
     if [[ -f "$VM_STORAGE_DIR/${vm_name}.qcow2" ]]; then
         disk_size=$(du -sh "$VM_STORAGE_DIR/${vm_name}.qcow2" | cut -f1)
@@ -356,6 +462,7 @@ show_vm_header() {
     fi
 
     echo -e "  ├─ MAC: $mac"
+    echo -e "  ├─ IP Asignada: \e[32m$vm_ip\e[0m"
     echo -e "  ├─ Hostfwd Activos: $hostfwd"
     echo -e "  ├─ Tamaño Disco Principal: $disk_size"
     echo -e "  └─ Socket QMP/Monitor: $status_socket"
@@ -540,8 +647,7 @@ attach_resources() {
         1*)
             read -rp "--> Nombre o identificador del disco extra: " DISK_LABEL
             DISK_LABEL=$(sanitize_name "$DISK_LABEL")
-            read -rp "--> Tamaño en GB [10]: " SEC_SIZE; SEC_SIZE=${SEC_SIZE:-10}
-            SEC_SIZE=$(echo "$SEC_SIZE" | tr -cd '0-9')
+            SEC_SIZE=$(select_disk_size)
             SEC_DISK_PATH="$VM_STORAGE_DIR/${vm_name}-${DISK_LABEL}.qcow2"
             
             qemu-img create -f qcow2 "$SEC_DISK_PATH" "${SEC_SIZE}G"
