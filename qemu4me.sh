@@ -426,8 +426,6 @@ create_vm() {
     MONITOR_SOCKET="$QMP_DIR/${VM_NAME}-monitor.sock"
     QMP_SOCKET="$QMP_DIR/${VM_NAME}-qmp.sock"
 
-    VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
-
     # Solicitar opción de captura PCAP nativa
     read -rp "--> ¿Activar captura de tráfico PCAP nativa en QEMU? (s/N): " ENABLE_PCAP
     PCAP_ARG=""
@@ -459,6 +457,7 @@ done
 umask 077
 
 exec qemu-system-x86_64 \\
+    -name "$VM_NAME" \\
     -enable-kvm \\
     -cpu host,kvm=on \\
     -smp $VM_CPUS \\
@@ -477,6 +476,9 @@ exec qemu-system-x86_64 \\
 EOF
 
     chmod +x "$VM_SCRIPT"
+    echo -e "\e[32m[✓] VM '$VM_NAME' creada exitosamente.\e[0m"
+    read -rp "Presiona Enter..."
+}
 
 show_vm_header() {
     local vm_name="$1"
