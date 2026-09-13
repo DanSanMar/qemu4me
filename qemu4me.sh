@@ -9,6 +9,7 @@ set -e
 # Directorios y rutas por defecto
 VM_DIR="/var/lib/libvirt/images"
 ISO_SEARCH_DIR="$HOME"
+TMP_XML=""
 
 # Lista de paquetes del sistema necesarios
 REQUIRED_PACKAGES=(
@@ -20,6 +21,22 @@ REQUIRED_PACKAGES=(
     "fzf"
     "gawk"
 )
+
+# ==============================================================================
+#  Trap de Limpieza y Salida
+# ==============================================================================
+cleanup() {
+    # Restaurar cursor por si fzf o una interrupción lo ocultó
+    tput cnorm 2>/dev/null || true
+    
+    # Eliminar XML temporal si existe
+    if [[ -n "$TMP_XML" && -f "$TMP_XML" ]]; then
+        rm -f "$TMP_XML"
+    fi
+}
+
+# Capturar Ctrl+C (SIGINT), SIGTERM y la salida del script (EXIT)
+trap 'cleanup' EXIT SIGINT SIGTERM
 
 # Función para mostrar el logo
 show_logo() {
@@ -78,111 +95,111 @@ check_and_install_dependencies() {
 }
 
 # ==============================================================================
-#  Inicio del Script
+#  Módulo: Crear Nueva VM
 # ==============================================================================
+create_vm() {
+    show_logo
+    echo -e "\e[33m--- Creación de Nueva Máquina Virtual ---\e[0m\n"
 
-show_logo
-check_and_install_dependencies
+    # 1. Nombre de la máquina virtual
+    read -rp "--> Introduce el nombre de la VM: " VM_NAME
+    if [[ -z "$VM_NAME" ]]; then
+        echo -e "\e[31m[!] El nombre no puede estar vacío.\e[0m"
+        read -rp "Presiona Enter para continuar..."
+        return
+    fi
 
-# 1. Nombre de la máquina virtual
-read -rp "--> Introduce el nombre de la VM: " VM_NAME
-if [[ -z "$VM_NAME" ]]; then
-    echo -e "\e[31m[!] El nombre no puede estar vacío.\e[0m"
-    exit 1
-fi
+    # 2. Buscar imagen ISO usando fzf
+    echo -e "\n\e[34m[+] Buscando archivos .iso en $ISO_SEARCH_DIR...\e[0m"
+    ISO_PATH=$(find "$ISO_SEARCH_DIR" -type f -name "*.iso" 2>/dev/null | fzf --prompt="Selecciona la ISO de instalación: ")
 
-# 2. Buscar imagen ISO usando fzf
-echo -e "\n\e[34m[+] Buscando archivos .iso en $ISO_SEARCH_DIR...\e[0m"
-ISO_PATH=$(find "$ISO_SEARCH_DIR" -type f -name "*.iso" 2>/dev/null | fzf --prompt="Selecciona la ISO de instalación: ")
+    if [[ -z "$ISO_PATH" ]]; then
+        echo -e "\e[31m[!] No se seleccionó ninguna ISO.\e[0m"
+        read -rp "Presiona Enter para continuar..."
+        return
+    fi
+    echo -e "\e[32m[✓] ISO Seleccionada:\e[0m $ISO_PATH"
 
-if [[ -z "$ISO_PATH" ]]; then
-    echo -e "\e[31m[!] No se seleccionó ninguna ISO. Cancelando.\e[0m"
-    exit 1
-fi
-echo -e "\e[32m[✓] ISO Seleccionada:\e[0m $ISO_PATH"
+    # 3. Asignación de RAM (en MB)
+    read -rp "--> Memoria RAM en MB [Por defecto: 2048]: " VM_RAM
+    VM_RAM=${VM_RAM:-2048}
 
-# 3. Asignación de RAM (en MB)
-read -rp "--> Memoria RAM en MB [Por defecto: 2048]: " VM_RAM
-VM_RAM=${VM_RAM:-2048}
+    # 4. Asignación de vCPUs
+    read -rp "--> Número de vCPUs [Por defecto: 2]: " VM_CPUS
+    VM_CPUS=${VM_CPUS:-2}
 
-# 4. Asignación de vCPUs
-read -rp "--> Número de vCPUs [Por defecto: 2]: " VM_CPUS
-VM_CPUS=${VM_CPUS:-2}
+    # 5. Tamaño del disco duro (en GB)
+    read -rp "--> Tamaño del disco qcow2 en GB [Por defecto: 20]: " DISK_SIZE
+    DISK_SIZE=${DISK_SIZE:-20}
 
-# 5. Tamaño del disco duro (en GB)
-read -rp "--> Tamaño del disco qcow2 en GB [Por defecto: 20]: " DISK_SIZE
-DISK_SIZE=${DISK_SIZE:-20}
+    # 6. Selección del tipo de red usando fzf
+    echo -e "\n\e[34m[+] Selecciona el modo de red:\e[0m"
+    NET_TYPE=$(echo -e "Bridge (Macvtap directo a la interfaz del Host)\nNAT (Red predeterminada de Libvirt)\nAislada (Host-Only)" | fzf --prompt="Tipo de Red: ")
 
-# 6. Selección del tipo de red usando fzf
-echo -e "\n\e[34m[+] Selecciona el modo de red:\e[0m"
-NET_TYPE=$(echo -e "Bridge (Macvtap directo a la interfaz del Host)\nNAT (Red predeterminada de Libvirt)\nAislada (Host-Only)" | fzf --prompt="Tipo de Red: ")
-
-case "$NET_TYPE" in
-    *"Bridge"*)
-        echo -e "\n\e[34m[+] Selecciona la interfaz física de red para el Bridge:\e[0m"
-        PHYS_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | fzf --prompt="Interfaz física: ")
-        if [[ -z "$PHYS_IFACE" ]]; then
-            echo -e "\e[31m[!] No se seleccionó interfaz. Cancelando.\e[0m"
-            exit 1
-        fi
-        NET_XML="<interface type='direct'>
+    case "$NET_TYPE" in
+        *"Bridge"*)
+            echo -e "\n\e[34m[+] Selecciona la interfaz física de red para el Bridge:\e[0m"
+            PHYS_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | fzf --prompt="Interfaz física: ")
+            if [[ -z "$PHYS_IFACE" ]]; then
+                echo -e "\e[31m[!] No se seleccionó interfaz.\e[0m"
+                read -rp "Presiona Enter para continuar..."
+                return
+            fi
+            NET_XML="<interface type='direct'>
       <source dev='$PHYS_IFACE' mode='bridge'/>
       <model type='virtio'/>
     </interface>"
-        ;;
-    *"NAT"*)
-        NET_XML="<interface type='network'>
+            ;;
+        *"NAT"*)
+            NET_XML="<interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
     </interface>"
-        ;;
-    *"Aislada"*)
-        NET_XML="<interface type='network'>
+            ;;
+        *"Aislada"*)
+            NET_XML="<interface type='network'>
       <source network='isolated'/>
       <model type='virtio'/>
     </interface>"
-        ;;
-    *)
-        echo -e "\e[31m[!] Opción de red inválida. Cancelando.\e[0m"
-        exit 1
-        ;;
-esac
+            ;;
+        *)
+            echo -e "\e[31m[!] Opción de red inválida.\e[0m"
+            read -rp "Presiona Enter para continuar..."
+            return
+            ;;
+    esac
 
-# 7. Resumen de configuración
-show_logo
-echo -e "\e[33m=== Resumen de Configuración ===\e[0m"
-echo -e "Nombre VM  : $VM_NAME"
-echo -e "RAM        : ${VM_RAM} MB"
-echo -e "vCPUs      : $VM_CPUS"
-echo -e "Disco      : ${DISK_SIZE} GB ($VM_DIR/${VM_NAME}.qcow2)"
-echo -e "Red        : $NET_TYPE"
-echo -e "ISO        : $ISO_PATH"
-echo -e "================================\n"
+    # 7. Resumen de configuración
+    show_logo
+    echo -e "\e[33m=== Resumen de Configuración ===\e[0m"
+    echo -e "Nombre VM  : $VM_NAME"
+    echo -e "RAM        : ${VM_RAM} MB"
+    echo -e "vCPUs      : $VM_CPUS"
+    echo -e "Disco      : ${DISK_SIZE} GB ($VM_DIR/${VM_NAME}.qcow2)"
+    echo -e "Red        : $NET_TYPE"
+    echo -e "ISO        : $ISO_PATH"
+    echo -e "================================\n"
 
-read -rp "¿Deseas crear y lanzar la máquina virtual? (S/n): " CONFIRM
-CONFIRM=${CONFIRM:-S}
-if [[ ! "$CONFIRM" =~ ^[Ss]$ ]]; then
-    echo -e "\e[31m[!] Operación cancelada.\e[0m"
-    exit 0
-fi
+    read -rp "¿Deseas crear y lanzar la máquina virtual? (S/n): " CONFIRM
+    CONFIRM=${CONFIRM:-S}
+    if [[ ! "$CONFIRM" =~ ^[Ss]$ ]]; then
+        echo -e "\e[31m[!] Operación cancelada.\e[0m"
+        read -rp "Presiona Enter para continuar..."
+        return
+    fi
 
-# --- Proceso de Creación ---
+    # --- Proceso de Creación ---
+    DISCO_PATH="$VM_DIR/${VM_NAME}.qcow2"
+    TMP_XML="/tmp/${VM_NAME}.xml"
 
-DISCO_PATH="$VM_DIR/${VM_NAME}.qcow2"
-XML_PATH="/tmp/${VM_NAME}.xml"
+    sudo mkdir -p "$VM_DIR"
 
-# Crear la carpeta de imágenes si no existe
-sudo mkdir -p "$VM_DIR"
+    echo -e "\n\e[34m[+] Creando disco virtual qcow2...\e[0m"
+    sudo qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
 
-# Crear la imagen de disco con qemu-img
-echo -e "\n\e[34m[+] Creando disco virtual qcow2...\e[0m"
-sudo qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
+    RAM_KIB=$((VM_RAM * 1024))
 
-# Convertir RAM a KiB para el XML de libvirt
-RAM_KIB=$((VM_RAM * 1024))
-
-# Generar el archivo XML para libvirt
-cat <<EOF > "$XML_PATH"
+    cat <<EOF > "$TMP_XML"
 <domain type='kvm'>
   <name>${VM_NAME}</name>
   <memory unit='KiB'>${RAM_KIB}</memory>
@@ -215,13 +232,103 @@ cat <<EOF > "$XML_PATH"
 </domain>
 EOF
 
-# Definir e iniciar la VM en Libvirt mediante virsh
-echo -e "\e[34m[+] Registrando la VM en Libvirt...\e[0m"
-sudo virsh define "$XML_PATH"
-rm "$XML_PATH"
+    echo -e "\e[34m[+] Registrando la VM en Libvirt...\e[0m"
+    sudo virsh define "$TMP_XML"
+    rm -f "$TMP_XML"
+    TMP_XML=""
 
-echo -e "\e[34m[+] Arrancando la VM ${VM_NAME}...\e[0m"
-sudo virsh start "$VM_NAME"
+    echo -e "\e[34m[+] Arrancando la VM ${VM_NAME}...\e[0m"
+    sudo virsh start "$VM_NAME"
 
-echo -e "\n\e[32m[✓] ¡Máquina virtual '${VM_NAME}' creada y lanzada correctamente!\e[0m"
-echo -e "Comprueba el puerto VNC asignado ejecutando: \e[36msudo virsh vncdisplay ${VM_NAME}\e[0m"
+    echo -e "\n\e[32m[✓] ¡Máquina virtual '${VM_NAME}' creada y lanzada correctamente!\e[0m"
+    echo -e "Puerto VNC asignado: \e[36msudo virsh vncdisplay ${VM_NAME}\e[0m"
+    read -rp "Presiona Enter para volver al menú..."
+}
+
+# ==============================================================================
+#  Módulo: Gestionar VMs Existentes
+# ==============================================================================
+manage_vms() {
+    show_logo
+    echo -e "\e[33m--- Gestión de Máquinas Virtuales ---\e[0m\n"
+
+    # Obtener lista de VMs registradas
+    VMS=$(sudo virsh list --all --name | grep -v '^$')
+
+    if [[ -z "$VMS" ]]; then
+        echo -e "\e[31m[!] No hay máquinas virtuales registradas en Libvirt.\e[0m"
+        read -rp "Presiona Enter para continuar..."
+        return
+    fi
+
+    SELECTED_VM=$(echo "$VMS" | fzf --prompt="Selecciona una VM: ")
+
+    if [[ -z "$SELECTED_VM" ]]; then
+        return
+    fi
+
+    ACTION=$(echo -e "Arrancar (Start)\nApagar (Shutdown)\nForzar Apagado (Destroy)\nEliminar VM (Undefine + Borrar Disco)\nVolver" | fzf --prompt="Acción para [$SELECTED_VM]: ")
+
+    case "$ACTION" in
+        *"Arrancar"*)
+            sudo virsh start "$SELECTED_VM"
+            echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada.\e[0m"
+            ;;
+        *"Apagar"*)
+            sudo virsh shutdown "$SELECTED_VM"
+            echo -e "\e[33m[!] Orden de apagado enviada a '$SELECTED_VM'.\e[0m"
+            ;;
+        *"Forzar"*)
+            sudo virsh destroy "$SELECTED_VM"
+            echo -e "\e[31m[!] VM '$SELECTED_VM' forzada a apagar.\e[0m"
+            ;;
+        *"Eliminar"*)
+            read -rp "¿ESTÁS SEGURO de borrar la VM '$SELECTED_VM' y su disco? (s/N): " DEL_CONFIRM
+            if [[ "$DEL_CONFIRM" =~ ^[Ss]$ ]]; then
+                sudo virsh destroy "$SELECTED_VM" 2>/dev/null || true
+                sudo virsh undefine "$SELECTED_VM"
+                if [[ -f "$VM_DIR/${SELECTED_VM}.qcow2" ]]; then
+                    sudo rm -f "$VM_DIR/${SELECTED_VM}.qcow2"
+                fi
+                echo -e "\e[31m[✓] VM '$SELECTED_VM' y su disco han sido eliminados.\e[0m"
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
+
+    read -rp "Presiona Enter para continuar..."
+}
+
+# ==============================================================================
+#  Bucle del Menú Principal
+# ==============================================================================
+main_menu() {
+    check_and_install_dependencies
+
+    while true; do
+        show_logo
+        MENU_OPTION=$(echo -e "1. Crear nueva VM\n2. Gestionar / Listar VMs\n3. Salir" | fzf --prompt="Selecciona una opción: ")
+
+        case "$MENU_OPTION" in
+            1*)
+                create_vm
+                ;;
+            2*)
+                manage_vms
+                ;;
+            3*)
+                echo -e "\e[32m¡Hasta luego!\e[0m"
+                exit 0
+                ;;
+            *)
+                echo -e "\e[32mSaliendo...\e[0m"
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# Ejecutar menú principal
+main_menu
