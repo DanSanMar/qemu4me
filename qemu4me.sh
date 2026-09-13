@@ -2,7 +2,7 @@
 
 # ==============================================================================
 #  qemu4me - Gestor ultraligero de VMs para Pentesting (QEMU Nativo)
-#  Auditoría & Hardening: DevSecOps Standard
+#  Auditoría & Hardening: DevSecOps Standard (Soporte Bridge Aislado / Wi-Fi)
 # ==============================================================================
 
 set -eo pipefail
@@ -121,7 +121,7 @@ check_and_install_dependencies() {
 
     case "$DISTRO" in
         arch)
-            for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip; do
+            for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip dnsmasq; do
                 pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
@@ -130,7 +130,7 @@ check_and_install_dependencies() {
             fi
             ;;
         fedora)
-            for pkg in qemu-kvm fzf gawk tar iproute nc socat xclip; do
+            for pkg in qemu-kvm fzf gawk tar iproute nc socat xclip dnsmasq; do
                 rpm -q "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
@@ -139,7 +139,7 @@ check_and_install_dependencies() {
             fi
             ;;
         debian)
-            for pkg in qemu-system-x86 fzf gawk tar iproute2 netcat-openbsd socat xclip; do
+            for pkg in qemu-system-x86 fzf gawk tar iproute2 netcat-openbsd socat xclip dnsmasq; do
                 dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
@@ -149,7 +149,7 @@ check_and_install_dependencies() {
             ;;
     esac
 
-    # Hardening & Configuración de Bridge Helper y ACLs
+    # Hardening & Configuración de Bridge Helper
     if [[ ! -f /etc/qemu/bridge.conf ]]; then
         echo -e "\e[33m[!] Configurando /etc/qemu/bridge.conf para el modo bridge...\e[0m"
         sudo mkdir -p /etc/qemu
@@ -187,6 +187,33 @@ get_bridge_interfaces() {
     ip -d link show type bridge | grep -E '^[0-9]+:' | awk -F': ' '{print $2}'
 }
 
+setup_lab_bridge() {
+    local bridge_name="br-lab"
+    local bridge_ip="192.168.100.1/24"
+    local dhcp_range_start="192.168.100.10"
+    local dhcp_range_end="192.168.100.100"
+
+    if ! ip link show dev "$bridge_name" &>/dev/null; then
+        echo -e "\e[34m[+] Creando interfaz bridge aislada '$bridge_name'...\e[0m"
+        sudo ip link add name "$bridge_name" type bridge
+        sudo ip addr add "$bridge_ip" dev "$bridge_name"
+        sudo ip link set dev "$bridge_name" up
+    fi
+
+    # Configurar servicio DHCP rápido en el bridge para alimentar a las VMs si dnsmasq está instalado
+    if command -v dnsmasq &>/dev/null; then
+        if ! pgrep -f "dnsmasq.*$bridge_name" &>/dev/null; then
+            echo -e "\e[34m[+] Levantando DHCPServer en '$bridge_name' ($dhcp_range_start - $dhcp_range_end)...\e[0m"
+            sudo dnsmasq --interface="$bridge_name" \
+                         --bind-interfaces \
+                         --dhcp-range="$dhcp_range_start,$dhcp_range_end,12h" \
+                         --pid-file="/tmp/dnsmasq-$bridge_name.pid" 2>/dev/null || true
+        fi
+    fi
+
+    echo "$bridge_name"
+}
+
 get_vm_ip_address() {
     local mac_addr="$1"
     if [[ -z "$mac_addr" || "$mac_addr" == "Desconocida" ]]; then
@@ -201,13 +228,14 @@ get_vm_ip_address() {
     # Método 1: Búsqueda en IP Neighbor / ARP
     ip_found=$(ip neighbor show | grep -i "$mac_lower" | awk '{print $1}' | head -n1)
 
-    # Método 2: Tablas de concesión DHCP locales (dnsmasq / NetworkManager / systemd-networkd)
+    # Método 2: Tablas de concesión DHCP locales
     if [[ -z "$ip_found" ]]; then
         local lease_files=(
             /var/lib/misc/dnsmasq.leases
             /var/lib/dhcp/dhcpd.leases
             /var/lib/NetworkManager/*.lease
             /var/lib/systemd/network/*.lease
+            /tmp/dnsmasq*.leases
         )
         for lf in "${lease_files[@]}"; do
             if [[ -f "$lf" ]]; then
@@ -274,11 +302,25 @@ select_disk_size() {
 
 configure_network() {
     echo -e "\n\e[34m[+] Seleccione la arquitectura de red:\e[0m"
-    NET_MODE=$(echo -e "1. Bridge Nativo (Layer 2 / Requiere Bridge local)\n2. User / NAT + Port Forwarding (No Root / Wi-Fi Restringido)" | fzf --prompt="Modo de Red: ")
+    NET_MODE=$(echo -e "1. Bridge Aislado / Pentesting Lab (Recomendado Wi-Fi / br-lab)\n2. Bridge Existente (Ethernet / br0 / docker0)\n3. User / NAT + Port Forwarding" | fzf --prompt="Modo de Red: ")
 
     RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
 
-    if [[ "$NET_MODE" =~ "User" ]]; then
+    if [[ "$NET_MODE" =~ "Aislado" ]]; then
+        SELECTED_BRIDGE=$(setup_lab_bridge)
+        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
+    elif [[ "$NET_MODE" =~ "Bridge Existente" ]]; then
+        BRIDGES=$(get_bridge_interfaces)
+        if [[ -z "$BRIDGES" ]]; then
+            echo -e "\e[33m[!] No se encontraron bridges activos. Creando 'br-lab' automáticamente...\e[0m"
+            SELECTED_BRIDGE=$(setup_lab_bridge)
+        else
+            SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Selecciona la interfaz Bridge: ")
+        fi
+        [[ -z "$SELECTED_BRIDGE" ]] && SELECTED_BRIDGE="br-lab"
+        SELECTED_BRIDGE=$(sanitize_name "$SELECTED_BRIDGE")
+        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
+    else
         read -rp "--> Redirecciones de puerto hostfwd (Ej: tcp::2222-:22,tcp::8080-:80): " FWD_RULES
         local FWD_STR=""
         if [[ -n "$FWD_RULES" ]]; then
@@ -289,20 +331,6 @@ configure_network() {
             done
         fi
         NET_ARGS="-netdev user,id=net0${FWD_STR} -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
-    else
-        BRIDGES=$(get_bridge_interfaces)
-        if [[ -z "$BRIDGES" ]]; then
-            echo -e "\e[33m[!] No se detectaron interfaces 'bridge' activas.\e[0m"
-            echo -e "\e[33m[!] Creando puerto puente por defecto 'br0' temporal con iproute2...\e[0m"
-            sudo ip link add name br0 type bridge
-            sudo ip link set dev br0 up
-            SELECTED_BRIDGE="br0"
-        else
-            SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Selecciona la interfaz Bridge: ")
-        fi
-        [[ -z "$SELECTED_BRIDGE" ]] && SELECTED_BRIDGE="br0"
-        SELECTED_BRIDGE=$(sanitize_name "$SELECTED_BRIDGE")
-        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     fi
 }
 
