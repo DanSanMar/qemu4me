@@ -66,20 +66,28 @@ check_free_space() {
 send_qmp_cmd() {
     local socket="$1"
     local cmd="$2"
+    local lock_file="${socket}.lock"
 
     if [[ ! -S "$socket" ]]; then
         echo -e "\e[31m[!] Socket Unix no activo: $socket\e[0m"
         return 1
     fi
 
+    # Bloqueo de concurrencia
+    exec 200>"$lock_file"
+    flock -x -w 3 200 || { echo -e "\e[31m[!] Socket QMP ocupado.\e[0m"; return 1; }
+
     if command -v socat &>/dev/null; then
         echo "$cmd" | socat - "UNIX-CONNECT:$socket" 2>/dev/null
     elif nc -h 2>&1 | grep -q '\-U'; then
         echo "$cmd" | nc -U "$socket" 2>/dev/null
     else
-        echo -e "\e[31m[!] Error: Se requiere 'socat' o 'netcat-openbsd' (nc -U) para comunicación QMP.\e[0m"
+        echo -e "\e[31m[!] Se requiere 'socat' o 'netcat-openbsd'.\e[0m"
+        exec 200>&-
         return 1
     fi
+
+    exec 200>&-
 }
 
 copy_to_clipboard() {
@@ -188,10 +196,10 @@ get_bridge_interfaces() {
 }
 
 setup_lab_bridge() {
-    local bridge_name="br-lab"
-    local bridge_ip="192.168.100.1/24"
-    local dhcp_range_start="192.168.100.10"
-    local dhcp_range_end="192.168.100.100"
+    local bridge_name="${1:-br-lab}"
+    local bridge_ip="${2:-192.168.100.1/24}"
+    local dhcp_start="${3:-192.168.100.10}"
+    local dhcp_end="${4:-192.168.100.100}"
 
     if ! ip link show dev "$bridge_name" &>/dev/null; then
         echo -e "\e[34m[+] Creando interfaz bridge aislada '$bridge_name'...\e[0m"
@@ -200,17 +208,15 @@ setup_lab_bridge() {
         sudo ip link set dev "$bridge_name" up
     fi
 
-    # Configurar servicio DHCP rápido en el bridge para alimentar a las VMs si dnsmasq está instalado
     if command -v dnsmasq &>/dev/null; then
         if ! pgrep -f "dnsmasq.*$bridge_name" &>/dev/null; then
-            echo -e "\e[34m[+] Levantando DHCPServer en '$bridge_name' ($dhcp_range_start - $dhcp_range_end)...\e[0m"
+            echo -e "\e[34m[+] Levantando DHCP Server en '$bridge_name'...\e[0m"
             sudo dnsmasq --interface="$bridge_name" \
                          --bind-interfaces \
-                         --dhcp-range="$dhcp_range_start,$dhcp_range_end,12h" \
+                         --dhcp-range="$dhcp_start,$dhcp_end,12h" \
                          --pid-file="/tmp/dnsmasq-$bridge_name.pid" 2>/dev/null || true
         fi
     fi
-
     echo "$bridge_name"
 }
 
@@ -421,6 +427,17 @@ create_vm() {
     QMP_SOCKET="$QMP_DIR/${VM_NAME}-qmp.sock"
 
     VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
+
+    # Solicitar opción de captura PCAP nativa
+    read -rp "--> ¿Activar captura de tráfico PCAP nativa en QEMU? (s/N): " ENABLE_PCAP
+    PCAP_ARG=""
+    if [[ "$ENABLE_PCAP" =~ ^[Ss]$ ]]; then
+        PCAP_PATH="$CONFIG_DIR/captures/${VM_NAME}_$(date +%Y%m%d_%H%M%S).pcap"
+        mkdir -p "$CONFIG_DIR/captures"
+        PCAP_ARG="-object filter-dump,id=pcap0,netdev=net0,file=$PCAP_PATH"
+    fi
+
+    VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
     cat <<EOF > "$VM_SCRIPT"
 #!/usr/bin/env bash
 
@@ -443,13 +460,16 @@ umask 077
 
 exec qemu-system-x86_64 \\
     -enable-kvm \\
-    -name "$VM_NAME" \\
-    -m $VM_RAM \\
+    -cpu host,kvm=on \\
     -smp $VM_CPUS \\
+    -m $VM_RAM \\
+    -device virtio-balloon-pci,id=balloon0 \\
+    -device virtio-rng-pci,id=rng0 \\
     \$SNAPSHOT_OPT \\
     $DRIVE_ARGS \\
     $CDROM_ARG \\
     $NET_ARGS \\
+    $PCAP_ARG \\
     -monitor unix:"$MONITOR_SOCKET",server,nowait \\
     -qmp unix:"$QMP_SOCKET",server,nowait \\
     -vga virtio \\
@@ -457,9 +477,6 @@ exec qemu-system-x86_64 \\
 EOF
 
     chmod +x "$VM_SCRIPT"
-    echo -e "\n\e[32m[✓] ¡VM '$VM_NAME' configurada correctamente!\e[0m"
-    read -rp "Presiona Enter para continuar..."
-}
 
 show_vm_header() {
     local vm_name="$1"
