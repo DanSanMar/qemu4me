@@ -18,6 +18,42 @@ CAPTURE_DIR="$CONFIG_DIR/captures"
 
 TMP_OVA_DIR=""
 
+# ==============================================================================
+# Variables de Color y Estado
+# ==============================================================================
+RESET="\e[0m"
+BLANCO="\e[97m"
+BLANCO_NEGRITA="\e[1;37m"
+GRIS_CLARO="\e[37m"
+AZUL_OSCURO="\e[34m"
+AZUL_BRILLANTE="\e[1;34m"
+AZUL_CLARO="\e[94m"
+VERDE="\e[32m"
+VERDE_BRILLANTE="\e[1;32m"
+AMARILLO="\e[33m"
+AMARILLO_BRILLANTE="\e[1;33m"
+CIAN="\e[36m"
+CIAN_BRILLANTE="\e[1;36m"
+ROJO="\e[31m"
+ROJO_BRILLANTE="\e[1;31m"
+
+VER="v2.0"
+
+# Guardián contra ejecución innecesaria con 'sudo'
+check_sudo_usage() {
+    if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        echo -e "${ROJO_BRILLANTE}[!] ATENCIÓN: Has ejecutado el script con 'sudo'.${RESET}"
+        echo -e "${AMARILLO}    Ejecutar con 'sudo' puede causar problemas de autorización gráfica (X11/Wayland)${RESET}"
+        echo -e "${AMARILLO}    y conflictos de permisos en el socket QMP de tus máquinas virtuales.${RESET}\n"
+        echo -e "${CIAN_BRILLANTE}[i] Sugerencia de uso:${RESET} Ejecuta el script de forma normal:"
+        echo -e "    ${VERDE_BRILLANTE}./prueba.sh${RESET}\n"
+        echo -e "El script te solicitará la clave 'sudo' únicamente cuando requiera levantar redes o asignar permisos."
+        echo "--------------------------------------------------------------------"
+        read -rp "Presiona Enter si deseas continuar de todos modos (o Ctrl+C para salir)..."
+    fi
+}
+check_sudo_usage
+
 mkdir -p "$VM_STORAGE_DIR" "$VM_CONFIG_DIR" "$QMP_DIR" "$PID_DIR" "$CAPTURE_DIR"
 chmod 700 "$CONFIG_DIR" "$QMP_DIR" "$PID_DIR"
 
@@ -30,16 +66,61 @@ trap 'cleanup' EXIT
 
 show_logo() {
     clear
-    echo -e "\e[36m"
-    cat << "EOF"
-  ██████╗ ███████╗███╗   ███╗██╗  ██╗███╗   ███╗███████╗
- ██╔═══██╗██╔════╝████╗ ████║██║  ██║████╗ ████║██╔════╝
- ██║   ██║█████╗  ██╔████╔██║███████║██╔████╔██║█████╗  
- ██║▄▄ ██║██╔══╝  ██║╚██╔╝██║╚════██║██║╚██╔╝██║██╔══╝  
- ╚██████╔╝███████╗██║ ╚═╝ ██║     ██║██║ ╚═╝ ██║███████╗
-  ╚══▀▀═╝ ╚══════╝╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝╚══════╝
-EOF
-    echo -e "\e[33m         -- Hardened VM Manager for Pentesting (Pure QEMU) --\e[0m\n"
+    local HORA_ACTUAL SEGUNDOS ULTIMO_DIGITO DIGITO_VER DIGITO_DASH
+    local COLOR_LOGO COLOR_VER COLOR_DASH
+
+    HORA_ACTUAL=$(date +"%H:%M:%S")
+    SEGUNDOS=$(date +"%S")
+
+    # Color del Titulo Principal (según el último dígito del segundo)
+    ULTIMO_DIGITO="${SEGUNDOS: -1}"
+    case "$ULTIMO_DIGITO" in
+        1) COLOR_LOGO="$AZUL_BRILLANTE" ;;
+        2) COLOR_LOGO="$VERDE_BRILLANTE" ;;
+        3) COLOR_LOGO="$AMARILLO_BRILLANTE" ;;
+        4) COLOR_LOGO="$CIAN_BRILLANTE" ;;
+        5) COLOR_LOGO="$ROJO_BRILLANTE" ;;
+        6) COLOR_LOGO="$AZUL_CLARO" ;;
+        7) COLOR_LOGO="$VERDE" ;;
+        8) COLOR_LOGO="$AMARILLO" ;;
+        9) COLOR_LOGO="$CIAN" ;;
+        0) COLOR_LOGO="$ROJO" ;;
+        *) COLOR_LOGO="$BLANCO_NEGRITA" ;;
+    esac
+
+    # Color de Versión (desfasado 5 segundos)
+    DIGITO_VER=$(( (10#$SEGUNDOS + 5) % 10 ))
+    case "$DIGITO_VER" in
+        1) COLOR_VER="$ROJO_BRILLANTE" ;;
+        2) COLOR_VER="$CIAN" ;;
+        3) COLOR_VER="$VERDE" ;;
+        4) COLOR_VER="$AMARILLO" ;;
+        5) COLOR_VER="$AZUL_BRILLANTE" ;;
+        6) COLOR_VER="$VERDE_BRILLANTE" ;;
+        7) COLOR_VER="$AMARILLO_BRILLANTE" ;;
+        8) COLOR_VER="$CIAN_BRILLANTE" ;;
+        9) COLOR_VER="$AZUL_CLARO" ;;
+        0) COLOR_VER="$BLANCO_NEGRITA" ;;
+        *) COLOR_VER="$CIAN" ;;
+    esac
+
+    # Color del Subtexto (desfasado 2 segundos)
+    DIGITO_DASH=$(( (10#$SEGUNDOS + 2) % 10 ))
+    case "$DIGITO_DASH" in
+        1) COLOR_DASH="$VERDE_BRILLANTE" ;;
+        2) COLOR_DASH="$AMARILLO_BRILLANTE" ;;
+        3) COLOR_DASH="$CIAN_BRILLANTE" ;;
+        4) COLOR_DASH="$ROJO_BRILLANTE" ;;
+        5) COLOR_DASH="$AZUL_CLARO" ;;
+        6) COLOR_DASH="$VERDE" ;;
+        7) COLOR_DASH="$AMARILLO" ;;
+        8) COLOR_DASH="$CIAN" ;;
+        9) COLOR_DASH="$ROJO" ;;
+        0) COLOR_DASH="$BLANCO_NEGRITA" ;;
+        *) COLOR_DASH="$GRIS_CLARO" ;;
+    esac
+
+    echo -e "${AZUL_BRILLANTE}--- ⚡ ${COLOR_LOGO}QEMU4ME${RESET} ${AZUL_OSCURO}| ${COLOR_DASH}PENTEST VM MANAGER${RESET} ${AZUL_OSCURO}| ${COLOR_VER}${VER}${RESET} ${BLANCO}:${HORA_ACTUAL}: ${AZUL_BRILLANTE}⚡---${RESET}\n"
 }
 
 sanitize_name() {
