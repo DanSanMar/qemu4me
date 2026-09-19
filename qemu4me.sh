@@ -15,7 +15,6 @@ QMP_DIR="$CONFIG_DIR/qmp"
 PID_DIR="$CONFIG_DIR/pids"
 CAPTURE_DIR="$CONFIG_DIR/captures"
 
-
 TMP_OVA_DIR=""
 
 # ==============================================================================
@@ -46,7 +45,7 @@ check_sudo_usage() {
         echo -e "${AMARILLO}    Ejecutar con 'sudo' puede causar problemas de autorización gráfica (X11/Wayland)${RESET}"
         echo -e "${AMARILLO}    y conflictos de permisos en el socket QMP de tus máquinas virtuales.${RESET}\n"
         echo -e "${CIAN_BRILLANTE}[i] Sugerencia de uso:${RESET} Ejecuta el script de forma normal:"
-        echo -e "    ${VERDE_BRILLANTE}./prueba.sh${RESET}\n"
+        echo -e "    ${VERDE_BRILLANTE}./qemu4me.sh${RESET}\n"
         echo -e "El script te solicitará la clave 'sudo' únicamente cuando requiera levantar redes o asignar permisos."
         echo "--------------------------------------------------------------------"
         read -rp "Presiona Enter si deseas continuar de todos modos (o Ctrl+C para salir)..."
@@ -60,19 +59,17 @@ chmod 700 "$CONFIG_DIR" "$QMP_DIR" "$PID_DIR"
 cleanup() {
     tput cnorm 2>/dev/null || true
     [[ -n "$TMP_OVA_DIR" && -d "$TMP_OVA_DIR" ]] && rm -rf "$TMP_OVA_DIR"
-    # Las VMs sobreviven al cierre del manager
 }
 trap 'cleanup' EXIT
 
-show_logo() {
-    clear
+# Genera el texto del logo (sin ejecutar 'clear' para permitir integrarse en FZF)
+get_logo_text() {
     local HORA_ACTUAL SEGUNDOS ULTIMO_DIGITO DIGITO_VER DIGITO_DASH
     local COLOR_LOGO COLOR_VER COLOR_DASH
 
     HORA_ACTUAL=$(date +"%H:%M:%S")
     SEGUNDOS=$(date +"%S")
 
-    # Color del Titulo Principal (según el último dígito del segundo)
     ULTIMO_DIGITO="${SEGUNDOS: -1}"
     case "$ULTIMO_DIGITO" in
         1) COLOR_LOGO="$AZUL_BRILLANTE" ;;
@@ -88,7 +85,6 @@ show_logo() {
         *) COLOR_LOGO="$BLANCO_NEGRITA" ;;
     esac
 
-    # Color de Versión (desfasado 5 segundos)
     DIGITO_VER=$(( (10#$SEGUNDOS + 5) % 10 ))
     case "$DIGITO_VER" in
         1) COLOR_VER="$ROJO_BRILLANTE" ;;
@@ -104,7 +100,6 @@ show_logo() {
         *) COLOR_VER="$CIAN" ;;
     esac
 
-    # Color del Subtexto (desfasado 2 segundos)
     DIGITO_DASH=$(( (10#$SEGUNDOS + 2) % 10 ))
     case "$DIGITO_DASH" in
         1) COLOR_DASH="$VERDE_BRILLANTE" ;;
@@ -120,12 +115,32 @@ show_logo() {
         *) COLOR_DASH="$GRIS_CLARO" ;;
     esac
 
-    echo -e "${AZUL_BRILLANTE}--- ⚡ ${COLOR_LOGO}QEMU4ME${RESET} ${AZUL_OSCURO}| ${COLOR_DASH}PENTEST VM MANAGER${RESET} ${AZUL_OSCURO}| ${COLOR_VER}${VER}${RESET} ${BLANCO}:${HORA_ACTUAL}: ${AZUL_BRILLANTE}⚡---${RESET}\n"
+    echo -e "${AZUL_BRILLANTE}--- ⚡ ${COLOR_LOGO}QEMU4ME${RESET} ${AZUL_OSCURO}| ${COLOR_DASH}PENTEST VM MANAGER${RESET} ${AZUL_OSCURO}| ${COLOR_VER}${VER}${RESET} ${BLANCO}:${HORA_ACTUAL}: ${AZUL_BRILLANTE}⚡---${RESET}"
+}
+
+show_logo() {
+    clear
+    get_logo_text
+    echo ""
 }
 
 sanitize_name() {
     local input="$1"
     echo "$input" | sed -E 's/[^a-zA-Z0-9_-]//g'
+}
+
+confirm_action() {
+    local prompt_msg="${1:-¿Deseas continuar?}"
+    local default_choice="${2:-Sí}"
+    
+    local choice
+    if [[ "$default_choice" == "Sí" ]]; then
+        choice=$(echo -e "Sí\nNo" | fzf --prompt="$prompt_msg: " --height=20% --reverse)
+    else
+        choice=$(echo -e "No\nSí" | fzf --prompt="$prompt_msg: " --height=20% --reverse)
+    fi
+
+    [[ "$choice" == "Sí" ]]
 }
 
 check_free_space() {
@@ -153,7 +168,6 @@ detect_accel() {
     fi
 }
 
-# Detecta el HOME del usuario real aunque el script se ejecute con 'sudo'
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     REAL_USER="$SUDO_USER"
     REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
@@ -162,7 +176,6 @@ else
     REAL_HOME="$HOME"
 fi
 
-# Directorios de búsqueda con el HOME corregido
 ISO_SEARCH_DIRS=(
     "$REAL_HOME/ISOs"
     "$REAL_HOME/isos"
@@ -187,7 +200,6 @@ find_images() {
         return 0
     fi
 
-    # Búsqueda segura respetando espacios y la identidad del usuario
     find "${valid_dirs[@]}" -maxdepth 4 -type f \( -iname "*.iso" -o -iname "*.ova" \) 2>/dev/null
 }
 
@@ -255,7 +267,6 @@ check_and_install_dependencies() {
 
     echo -e "\e[34m[+] Comprobando dependencias e infraestructura del sistema...\e[0m"
 
-    # 1. Instalación de paquetes según distribución
     case "$DISTRO" in
         arch)
             for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip dnsmasq; do
@@ -286,7 +297,6 @@ check_and_install_dependencies() {
             ;;
     esac
 
-    # 2. Infraestructura de Red TUN/TAP (Universal e Independiente de la distro)
     if ! lsmod | grep -q "^tun"; then
         echo -e "\e[34m[+] Cargando módulo del kernel 'tun'...\e[0m"
         sudo modprobe tun
@@ -299,13 +309,11 @@ check_and_install_dependencies() {
         sudo chmod 0666 /dev/net/tun
     fi
 
-    # Persistencia automática entre reinicios
     if [[ -d /etc/modules-load.d ]] && [[ ! -f /etc/modules-load.d/qemu4me-tun.conf ]]; then
         echo "tun" | sudo tee /etc/modules-load.d/qemu4me-tun.conf >/dev/null 2>&1 || true
         echo -e "\e[32m[✓] Persistencia de 'tun' configurada en /etc/modules-load.d/qemu4me-tun.conf\e[0m"
     fi
 
-    # 3. Configuración de bridge.conf
     if [[ ! -f /etc/qemu/bridge.conf ]]; then
         echo -e "\e[34m[+] Habilitando permisos en /etc/qemu/bridge.conf...\e[0m"
         sudo mkdir -p /etc/qemu
@@ -315,7 +323,6 @@ check_and_install_dependencies() {
         echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
     fi
 
-  # 4. Asignar SUID a qemu-bridge-helper (Búsqueda dinámica)
     local HELPER_BIN
     HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
 
@@ -324,12 +331,10 @@ check_and_install_dependencies() {
         sudo chmod 4755 "$HELPER_BIN" 2>/dev/null || true
     fi
 
-    # 5. Soporte de Pantalla (Wayland / X11)
     if [[ -n "${DISPLAY:-}" ]] && command -v xhost &>/dev/null; then
         xhost +si:localuser:root &>/dev/null || xhost +local:root &>/dev/null || true
     fi
 
-    # 6. Módulos KVM para aceleración por hardware
     if ! lsmod | grep -q kvm; then
         echo -e "\e[34m[+] Cargando módulos KVM...\e[0m"
         sudo modprobe kvm 2>/dev/null || true
@@ -337,7 +342,6 @@ check_and_install_dependencies() {
     fi
 
     echo -e "\e[32m[✓] Entorno del sistema verificado y preparado correctamente.\e[0m\n"
-    read -rp "Presiona Enter para continuar al menú..."
 }
 
 get_bridge_interfaces() {
@@ -484,7 +488,6 @@ launch_vm() {
     local script="$VM_CONFIG_DIR/${vm_name}.sh"
     local log="$CONFIG_DIR/${vm_name}.log"
 
-    # Inicia la VM de forma independiente sin acoplarse al menú
     setsid nohup "$script" "$@" >"$log" 2>&1 < /dev/null &
     sleep 1.5
 
@@ -512,7 +515,6 @@ create_vm() {
 
     echo -e "\n\e[34m[+] Buscando .iso y .ova en tus directorios...\e[0m"
     
-    # Guardamos los hallazgos en una variable usando una lista limpia
     local raw_images
     raw_images=$(find_images)
 
@@ -599,15 +601,13 @@ create_vm() {
 
     MONITOR_SOCKET="$QMP_DIR/${VM_NAME}-monitor.sock"
     QMP_SOCKET="$QMP_DIR/${VM_NAME}-qmp.sock"
-
-    read -rp "--> ¿Activar captura PCAP nativa? (s/N): " ENABLE_PCAP
     PCAP_ARG=""
-    if [[ "$ENABLE_PCAP" =~ ^[Ss]$ ]]; then
+
+    if confirm_action "--> ¿Activar captura PCAP nativa?" "No"; then
         PCAP_PATH="$CONFIG_DIR/captures/${VM_NAME}_$(date +%Y%m%d_%H%M%S).pcap"
         PCAP_ARG="-object filter-dump,id=pcap0,netdev=net0,file=$PCAP_PATH"
     fi
 
-    # Buscar la ruta real del helper para inyectarla en la plantilla
     HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
 
     VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
@@ -616,7 +616,6 @@ create_vm() {
 
 rm -f "$MONITOR_SOCKET" "$QMP_SOCKET"
 
-# Preservar entorno gráfico de la sesión de usuario
 export DISPLAY="${DISPLAY:-:0}"
 export XAUTHORITY="${XAUTHORITY:-$REAL_HOME/.Xauthority}"
 
@@ -657,24 +656,17 @@ EOF
     chmod +x "$VM_SCRIPT"
     echo -e "\e[32m[✓] VM '$VM_NAME' registrada correctamente.\e[0m"
 
-    # Preguntar si desea iniciar la VM inmediatamente
-    read -rp "--> ¿Deseas arrancar la VM '$VM_NAME' ahora? (S/n): " START_NOW
-    START_NOW=${START_NOW:-S}
-
-    if [[ "$START_NOW" =~ ^[Ss]$ ]]; then
+    if confirm_action "--> ¿Deseas arrancar la VM '$VM_NAME' ahora?" "Sí"; then
         echo -e "\n\e[34m[+] Iniciando la VM '$VM_NAME' en segundo plano...\e[0m"
         
-        # Arranca la VM usando la función existente
         local log="$CONFIG_DIR/${VM_NAME}.log"
         setsid nohup "$VM_SCRIPT" >"$log" 2>&1 < /dev/null &
         sleep 3
 
-        # Comprobar el estado del proceso
         if pgrep -f "qemu-system-x86_64.*-name $VM_NAME" >/dev/null; then
             echo -e "\e[32m[✓] Estado: ACTIVA (PID: $(pgrep -f "qemu.*-name $VM_NAME" | head -1))\e[0m"
             
-            # Intento de detección de IP con espera dinámica
-            echo -e "\e[34m[+] Esperando asignación de dirección IP (esto puede tardar unos segundos)...\e[0m"
+            echo -e "\e[34m[+] Esperando asignación de dirección IP...\e[0m"
             local mac
             mac=$(grep -o -E 'mac=[0-9A-Fa-f:]+' "$VM_SCRIPT" | cut -d'=' -f2 || echo "Desconocida")
             
@@ -973,7 +965,7 @@ manage_snapshots() {
             4*)
                 mapfile -t SNAPS < <(qemu-img snapshot -l "$primary_disk" | tail -n +3 | awk '{print $2}')
                 if [ ${#SNAPS[@]} -eq 0 ]; then
-                    echo -e "\e[31m[!] No hay snapshots disponiles.\e[0m"
+                    echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
                 else
                     TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Eliminar: ")
                     if [[ -n "$TARGET_SNAP" ]]; then
@@ -1032,14 +1024,13 @@ manage_vms() {
                 read -rp "Presiona Enter..."
                 ;;
             *"Eliminar"*)
-                read -rp "¿Confirmas eliminar '$SELECTED_VM' y TODOS sus discos? (s/N): " CONF
-                if [[ "$CONF" =~ ^[Ss]$ ]]; then
+                if confirm_action "¿Confirmas eliminar '$SELECTED_VM' y TODOS sus discos?" "No"; then
                     pkill -f "qemu-system-x86_64.*-name $SELECTED_VM" 2>/dev/null || true
                     rm -f "$VM_CONFIG_DIR/${SELECTED_VM}.sh"
                     rm -f "$VM_STORAGE_DIR/${SELECTED_VM}"*.qcow2
                     rm -f "$QMP_DIR/${SELECTED_VM}"*.sock
                     echo -e "\e[31m[✓] VM eliminada.\e[0m"
-                    read -rp "Presiona Enter..."
+                    read -rp "Presiona Enter para continuar..."
                     break
                 fi
                 ;;
@@ -1051,8 +1042,26 @@ manage_vms() {
 main_menu() {
     check_and_install_dependencies
     while true; do
-        show_logo
-        MENU_OPTION=$(echo -e "1. Crear nueva VM vulnerable (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Clonar VM Rápida (Linked Clone)\n4. Importar Bundle de VM (.tar.gz)\n5. Salir" | fzf --prompt="Selecciona Opción: ")
+        clear
+        local logo_header
+        logo_header=$(get_logo_text)
+
+        local options=(
+            "1. Crear VM Vulnerable      │ Despliega una nueva máquina a partir de ISO u OVA"
+            "2. Gestionar / Listar VMs     │ Arranca, detén, apaga, elimina o administra VMs"
+            "3. Clonación Rápida (Linked) │ Crea un clon liviano que comparte el disco base"
+            "4. Importar Bundle (.tar.gz) │ Restaura una VM previamente exportada"
+            "5. Salir                    │ Cerrar el gestor QEMU4ME"
+        )
+
+        MENU_OPTION=$(printf "%s\n" "${options[@]}" | fzf \
+            --ansi \
+            --header="$logo_header" \
+            --prompt="Selecciona una acción: " \
+            --reverse \
+            --height=100% \
+            --border)
+
         case "$MENU_OPTION" in
             1*) create_vm ;;
             2*) manage_vms ;;
