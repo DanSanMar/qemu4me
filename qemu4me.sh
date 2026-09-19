@@ -524,7 +524,7 @@ configure_network() {
 
     # Si se extrajo previamente del .ovf se mantiene; si no, se fija con prefijo QEMU OUI (52:54:00)
     if [[ -n "${EXTRACTED_MAC:-}" ]]; then
-        FINAL_MAC="$EXTRACTED_MAC"
+        FINAL_MAC=$(echo "$EXTRACTED_MAC" | tr -cd '0-9A-Fa-f:')
     else
         FINAL_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
     fi
@@ -612,7 +612,7 @@ create_vm() {
     DRIVE_ARGS=""
     CDROM_ARG=""
 
-    iEXTRACTED_MAC=""
+    EXTRACTED_MAC=""
     if [[ "$IMAGE_PATH" == *.ova ]]; then
         local file_size
         file_size=$(stat -c%s "$IMAGE_PATH" 2>/dev/null || stat -f%z "$IMAGE_PATH")
@@ -630,11 +630,11 @@ create_vm() {
         local ovf_file
         ovf_file=$(find "$TMP_OVA_DIR" -type f -name "*.ovf" | head -n1)
         if [[ -n "$ovf_file" && -f "$ovf_file" ]]; then
-            # Parsea patrones típicos de MAC en archivos XML/OVF (ej. MACAddress="080027XXXXXX")
             local raw_mac
             raw_mac=$(grep -iP 'MACAddress="?\K[0-9A-Fa-f]{12}' "$ovf_file" | head -n1 || true)
             if [[ -n "$raw_mac" ]]; then
-                EXTRACTED_MAC=$(echo "$raw_mac" | sed -E 's/(..)/\1:/g; s/:$//' | tr '[:upper:]' '[:lower:]')
+                # ASEGÚRATE DE LIMPIAR CUALQUIER CARACTER EXTRAÑO O ESPACIO
+                EXTRACTED_MAC=$(echo "$raw_mac" | tr -cd '0-9A-Fa-f' | sed -E 's/(..)/\1:/g; s/:$//' | tr '[:upper:]' '[:lower:]')
                 echo -e "\e[32m[✓] MAC Original extraída del OVF: $EXTRACTED_MAC\e[0m"
             fi
         fi
