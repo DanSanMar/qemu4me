@@ -5,26 +5,28 @@
 #  Auditoría & Hardening: DevSecOps Standard (Soporte Bridge Aislado / Wi-Fi)
 # ==============================================================================
 
-set -eo pipefail
+set -uo pipefail          # Quitamos -e global: una VM que falla no debe matar el manager
+shopt -s nullglob
 
 CONFIG_DIR="$HOME/.config/qemu4me"
 VM_STORAGE_DIR="$CONFIG_DIR/disks"
 VM_CONFIG_DIR="$CONFIG_DIR/vms"
 QMP_DIR="$CONFIG_DIR/qmp"
-ISO_SEARCH_DIR="$HOME"
+PID_DIR="$CONFIG_DIR/pids"
+CAPTURE_DIR="$CONFIG_DIR/captures"
+
+
 TMP_OVA_DIR=""
 
-mkdir -p "$VM_STORAGE_DIR" "$VM_CONFIG_DIR" "$QMP_DIR"
-chmod 700 "$CONFIG_DIR" "$QMP_DIR"
+mkdir -p "$VM_STORAGE_DIR" "$VM_CONFIG_DIR" "$QMP_DIR" "$PID_DIR" "$CAPTURE_DIR"
+chmod 700 "$CONFIG_DIR" "$QMP_DIR" "$PID_DIR"
 
 cleanup() {
     tput cnorm 2>/dev/null || true
-    if [[ -n "$TMP_OVA_DIR" && -d "$TMP_OVA_DIR" ]]; then
-        rm -rf "$TMP_OVA_DIR"
-    fi
+    [[ -n "$TMP_OVA_DIR" && -d "$TMP_OVA_DIR" ]] && rm -rf "$TMP_OVA_DIR"
+    # Las VMs sobreviven al cierre del manager
 }
-
-trap 'cleanup' EXIT SIGINT SIGTERM
+trap 'cleanup' EXIT
 
 show_logo() {
     clear
@@ -52,15 +54,60 @@ check_free_space() {
     available_bytes=$(df --output=avail -B1 "$path" | tail -n1 | tr -d ' ')
 
     if (( available_bytes < required_bytes )); then
-        local req_gb
+        local req_gb avail_gb
         req_gb=$(awk "BEGIN {printf \"%.2f\", $required_bytes/1073741824}")
-        local avail_gb
         avail_gb=$(awk "BEGIN {printf \"%.2f\", $available_bytes/1073741824}")
         echo -e "\e[31m[!] Error: Espacio en disco insuficiente en $path.\e[0m"
         echo -e "\e[31m    Requerido: ${req_gb} GB | Disponible: ${avail_gb} GB\e[0m"
         return 1
     fi
     return 0
+}
+
+detect_accel() {
+    if [[ -r /dev/kvm && -w /dev/kvm ]] && lsmod 2>/dev/null | grep -q kvm; then
+        echo "-enable-kvm -cpu host,kvm=on"
+    else
+        echo "-accel tcg,thread=multi -cpu qemu64"
+    fi
+}
+
+# Detecta el HOME del usuario real aunque el script se ejecute con 'sudo'
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_USER="${USER:-$LOGNAME}"
+    REAL_HOME="$HOME"
+fi
+
+# Directorios de búsqueda con el HOME corregido
+ISO_SEARCH_DIRS=(
+    "$REAL_HOME/ISOs"
+    "$REAL_HOME/isos"
+    "$REAL_HOME/Downloads"
+    "$REAL_HOME/Descargas"
+    "$REAL_HOME/VMs"
+    "$REAL_HOME/vms"
+    "$REAL_HOME/VirtualBox VMs"
+    "$REAL_HOME/Documents"
+    "$REAL_HOME/Documentos"
+)
+
+find_images() {
+    local valid_dirs=()
+    for d in "${ISO_SEARCH_DIRS[@]}"; do
+        if [[ -d "$d" ]]; then
+            valid_dirs+=("$d")
+        fi
+    done
+
+    if [ ${#valid_dirs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    # Búsqueda segura respetando espacios y la identidad del usuario
+    find "${valid_dirs[@]}" -maxdepth 4 -type f \( -iname "*.iso" -o -iname "*.ova" \) 2>/dev/null
 }
 
 send_qmp_cmd() {
@@ -73,7 +120,6 @@ send_qmp_cmd() {
         return 1
     fi
 
-    # Bloqueo de concurrencia
     exec 200>"$lock_file"
     flock -x -w 3 200 || { echo -e "\e[31m[!] Socket QMP ocupado.\e[0m"; return 1; }
 
@@ -86,7 +132,6 @@ send_qmp_cmd() {
         exec 200>&-
         return 1
     fi
-
     exec 200>&-
 }
 
@@ -112,9 +157,9 @@ detect_distro() {
             fedora|rhel|centos)      DISTRO="fedora" ;;
             ubuntu|debian|pop|kali)  DISTRO="debian" ;;
             *)
-                if [[ "$ID_LIKE" =~ "arch" ]]; then DISTRO="arch"
-                elif [[ "$ID_LIKE" =~ "fedora" ]]; then DISTRO="fedora"
-                elif [[ "$ID_LIKE" =~ "debian" ]]; then DISTRO="debian"
+                if [[ "${ID_LIKE:-}" =~ "arch" ]]; then DISTRO="arch"
+                elif [[ "${ID_LIKE:-}" =~ "fedora" ]]; then DISTRO="fedora"
+                elif [[ "${ID_LIKE:-}" =~ "debian" ]]; then DISTRO="debian"
                 else DISTRO="unknown"; fi
                 ;;
         esac
@@ -127,13 +172,16 @@ check_and_install_dependencies() {
     detect_distro
     local MISSING=()
 
+    echo -e "\e[34m[+] Comprobando dependencias e infraestructura del sistema...\e[0m"
+
+    # 1. Instalación de paquetes según distribución
     case "$DISTRO" in
         arch)
             for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip dnsmasq; do
                 pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias en Arch...\e[0m"
+                echo -e "\e[33m[!] Instalando paquetes faltantes en Arch Linux: ${MISSING[*]}\e[0m"
                 sudo pacman -S --needed --noconfirm "${MISSING[@]}"
             fi
             ;;
@@ -142,7 +190,7 @@ check_and_install_dependencies() {
                 rpm -q "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias en Fedora...\e[0m"
+                echo -e "\e[33m[!] Instalando paquetes faltantes en Fedora: ${MISSING[*]}\e[0m"
                 sudo dnf install -y "${MISSING[@]}"
             fi
             ;;
@@ -151,44 +199,64 @@ check_and_install_dependencies() {
                 dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[34m[+] Instalando dependencias en Debian/Ubuntu/Kali...\e[0m"
+                echo -e "\e[33m[!] Instalando paquetes faltantes en Debian/Ubuntu/Kali: ${MISSING[*]}\e[0m"
                 sudo apt-get update && sudo apt-get install -y "${MISSING[@]}"
             fi
             ;;
     esac
 
-    # Hardening & Configuración de Bridge Helper
+    # 2. Infraestructura de Red TUN/TAP (Universal e Independiente de la distro)
+    if ! lsmod | grep -q "^tun"; then
+        echo -e "\e[34m[+] Cargando módulo del kernel 'tun'...\e[0m"
+        sudo modprobe tun
+    fi
+
+    if [[ ! -c /dev/net/tun ]]; then
+        echo -e "\e[34m[+] Creando nodo de dispositivo /dev/net/tun...\e[0m"
+        sudo mkdir -p /dev/net
+        sudo mknod /dev/net/tun c 10 200 2>/dev/null || true
+        sudo chmod 0666 /dev/net/tun
+    fi
+
+    # Persistencia automática entre reinicios
+    if [[ -d /etc/modules-load.d ]] && [[ ! -f /etc/modules-load.d/qemu4me-tun.conf ]]; then
+        echo "tun" | sudo tee /etc/modules-load.d/qemu4me-tun.conf >/dev/null 2>&1 || true
+        echo -e "\e[32m[✓] Persistencia de 'tun' configurada en /etc/modules-load.d/qemu4me-tun.conf\e[0m"
+    fi
+
+    # 3. Configuración de bridge.conf
     if [[ ! -f /etc/qemu/bridge.conf ]]; then
-        echo -e "\e[33m[!] Configurando /etc/qemu/bridge.conf para el modo bridge...\e[0m"
+        echo -e "\e[34m[+] Habilitando permisos en /etc/qemu/bridge.conf...\e[0m"
         sudo mkdir -p /etc/qemu
         echo "allow all" | sudo tee /etc/qemu/bridge.conf >/dev/null
         sudo chmod 640 /etc/qemu/bridge.conf
-    else
-        if ! grep -q "allow all" /etc/qemu/bridge.conf; then
-            echo -e "\e[33m[!] Añadiendo 'allow all' a /etc/qemu/bridge.conf...\e[0m"
-            echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
-        fi
+    elif ! grep -q "allow all" /etc/qemu/bridge.conf; then
+        echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
     fi
 
-    local HELPER_PATHS=(
-        "/usr/lib/qemu/qemu-bridge-helper"
-        "/usr/libexec/qemu-bridge-helper"
-        "/usr/lib/qemu-kvm/qemu-bridge-helper"
-    )
+  # 4. Asignar SUID a qemu-bridge-helper (Búsqueda dinámica)
+    local HELPER_BIN
+    HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
 
-    for helper in "${HELPER_PATHS[@]}"; do
-        if [[ -f "$helper" ]]; then
-            if [[ ! -u "$helper" ]]; then
-                echo -e "\e[33m[!] Asignando permisos SUID a $helper...\e[0m"
-                sudo chmod u+s "$helper" 2>/dev/null || chmod 4755 "$helper" 2>/dev/null || true
-            fi
-        fi
-    done
+    if [[ -n "$HELPER_BIN" && -f "$HELPER_BIN" ]]; then
+        sudo chown root:root "$HELPER_BIN" 2>/dev/null || true
+        sudo chmod 4755 "$HELPER_BIN" 2>/dev/null || true
+    fi
 
+    # 5. Soporte de Pantalla (Wayland / X11)
+    if [[ -n "${DISPLAY:-}" ]] && command -v xhost &>/dev/null; then
+        xhost +si:localuser:root &>/dev/null || xhost +local:root &>/dev/null || true
+    fi
+
+    # 6. Módulos KVM para aceleración por hardware
     if ! lsmod | grep -q kvm; then
+        echo -e "\e[34m[+] Cargando módulos KVM...\e[0m"
         sudo modprobe kvm 2>/dev/null || true
         sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
     fi
+
+    echo -e "\e[32m[✓] Entorno del sistema verificado y preparado correctamente.\e[0m\n"
+    read -rp "Presiona Enter para continuar al menú..."
 }
 
 get_bridge_interfaces() {
@@ -202,7 +270,6 @@ setup_lab_bridge() {
     local dhcp_end="${4:-192.168.100.100}"
 
     if ! ip link show dev "$bridge_name" &>/dev/null; then
-        echo -e "\e[34m[+] Creando interfaz bridge aislada '$bridge_name'...\e[0m"
         sudo ip link add name "$bridge_name" type bridge
         sudo ip addr add "$bridge_ip" dev "$bridge_name"
         sudo ip link set dev "$bridge_name" up
@@ -210,7 +277,6 @@ setup_lab_bridge() {
 
     if command -v dnsmasq &>/dev/null; then
         if ! pgrep -f "dnsmasq.*$bridge_name" &>/dev/null; then
-            echo -e "\e[34m[+] Levantando DHCP Server en '$bridge_name'...\e[0m"
             sudo dnsmasq --interface="$bridge_name" \
                          --bind-interfaces \
                          --dhcp-range="$dhcp_start,$dhcp_end,12h" \
@@ -231,10 +297,8 @@ get_vm_ip_address() {
     mac_lower=$(echo "$mac_addr" | tr '[:upper:]' '[:lower:]')
     local ip_found=""
 
-    # Método 1: Búsqueda en IP Neighbor / ARP
     ip_found=$(ip neighbor show | grep -i "$mac_lower" | awk '{print $1}' | head -n1)
 
-    # Método 2: Tablas de concesión DHCP locales
     if [[ -z "$ip_found" ]]; then
         local lease_files=(
             /var/lib/misc/dnsmasq.leases
@@ -268,7 +332,7 @@ select_ram() {
         *"8192"*) echo "8192" ;;
         *)
             read -rp "--> Introduce RAM personalizada en MB [2048]: " CUSTOM_RAM
-            CUSTOM_RAM=$(echo "$CUSTOM_RAM" | tr -cd '0-9')
+            CUSTOM_RAM=$(echo "${CUSTOM_RAM:-2048}" | tr -cd '0-9')
             echo "${CUSTOM_RAM:-2048}"
             ;;
     esac
@@ -284,7 +348,7 @@ select_cpus() {
         *"8 CPUs"*) echo "8" ;;
         *)
             read -rp "--> Introduce vCPUs personalizadas [2]: " CUSTOM_CPUS
-            CUSTOM_CPUS=$(echo "$CUSTOM_CPUS" | tr -cd '0-9')
+            CUSTOM_CPUS=$(echo "${CUSTOM_CPUS:-2}" | tr -cd '0-9')
             echo "${CUSTOM_CPUS:-2}"
             ;;
     esac
@@ -300,44 +364,57 @@ select_disk_size() {
         *"80 GB"*) echo "80" ;;
         *)
             read -rp "--> Introduce tamaño de disco en GB [20]: " CUSTOM_DISK
-            CUSTOM_DISK=$(echo "$CUSTOM_DISK" | tr -cd '0-9')
+            CUSTOM_DISK=$(echo "${CUSTOM_DISK:-20}" | tr -cd '0-9')
             echo "${CUSTOM_DISK:-20}"
             ;;
     esac
 }
 
 configure_network() {
-    echo -e "\n\e[34m[+] Seleccione la arquitectura de red:\e[0m"
-    NET_MODE=$(echo -e "1. Bridge Aislado / Pentesting Lab (Recomendado Wi-Fi / br-lab)\n2. Bridge Existente (Ethernet / br0 / docker0)\n3. User / NAT + Port Forwarding" | fzf --prompt="Modo de Red: ")
+    echo -e "\n\e[34m[+] Modo de red:\e[0m"
+    NET_MODE=$(echo -e "1. Bridge Aislado br-lab (Wi-Fi)\n2. Bridge Existente\n3. User/NAT + hostfwd" \
+               | fzf --prompt="Red: ")
 
     RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
 
-    if [[ "$NET_MODE" =~ "Aislado" ]]; then
+    if [[ "$NET_MODE" =~ Aislado ]]; then
         SELECTED_BRIDGE=$(setup_lab_bridge)
         NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
-    elif [[ "$NET_MODE" =~ "Bridge Existente" ]]; then
+    elif [[ "$NET_MODE" =~ Existente ]]; then
         BRIDGES=$(get_bridge_interfaces)
-        if [[ -z "$BRIDGES" ]]; then
-            echo -e "\e[33m[!] No se encontraron bridges activos. Creando 'br-lab' automáticamente...\e[0m"
-            SELECTED_BRIDGE=$(setup_lab_bridge)
-        else
-            SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Selecciona la interfaz Bridge: ")
-        fi
+        SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Bridge: ")
         [[ -z "$SELECTED_BRIDGE" ]] && SELECTED_BRIDGE="br-lab"
         SELECTED_BRIDGE=$(sanitize_name "$SELECTED_BRIDGE")
         NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     else
-        read -rp "--> Redirecciones de puerto hostfwd (Ej: tcp::2222-:22,tcp::8080-:80): " FWD_RULES
-        local FWD_STR=""
+        read -rp "--> hostfwd (ej: tcp::2222-:22): " FWD_RULES
+        local fwd=""
         if [[ -n "$FWD_RULES" ]]; then
             FWD_RULES=$(echo "$FWD_RULES" | tr -cd 'a-zA-Z0-9_,-:')
             IFS=',' read -ra ADDR <<< "$FWD_RULES"
-            for i in "${ADDR[@]}"; do
-                FWD_STR+=",hostfwd=$i"
-            done
+            for i in "${ADDR[@]}"; do fwd+=",hostfwd=$i"; done
         fi
-        NET_ARGS="-netdev user,id=net0${FWD_STR} -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
+        NET_ARGS="-netdev user,id=net0${fwd} -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     fi
+}
+
+launch_vm() {
+    local vm_name="$1"; shift
+    local script="$VM_CONFIG_DIR/${vm_name}.sh"
+    local log="$CONFIG_DIR/${vm_name}.log"
+
+    # Inicia la VM de forma independiente sin acoplarse al menú
+    setsid nohup "$script" "$@" >"$log" 2>&1 < /dev/null &
+    sleep 1.5
+
+    if pgrep -f "qemu-system-x86_64.*-name $vm_name" >/dev/null; then
+        echo -e "\e[32m[✓] VM '$vm_name' ejecutándose en background (PID: $(pgrep -f "qemu.*-name $vm_name" | head -1)).\e[0m"
+        echo -e "\e[36m    Log: $log\e[0m"
+    else
+        echo -e "\e[31m[!] La VM no se pudo iniciar. Revisa el log: $log\e[0m"
+        tail -n 15 "$log"
+    fi
+    read -rp "Presiona Enter para continuar..."
 }
 
 create_vm() {
@@ -347,13 +424,27 @@ create_vm() {
     read -rp "--> Nombre de la VM: " RAW_NAME
     VM_NAME=$(sanitize_name "$RAW_NAME")
     if [[ -z "$VM_NAME" || -f "$VM_CONFIG_DIR/${VM_NAME}.sh" ]]; then
-        echo -e "\e[31m[!] Nombre inválido o VM ya existente.\e[0m"
+        echo -e "\e[31m[!] Nombre inválido o la VM ya existe.\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
 
-    echo -e "\n\e[34m[+] Buscando .iso y .ova en $ISO_SEARCH_DIR...\e[0m"
-    IMAGE_PATH=$(find "$ISO_SEARCH_DIR" -type f \( -name "*.iso" -o -name "*.ova" \) 2>/dev/null | fzf --prompt="Selecciona ISO u OVA: ")
+    echo -e "\n\e[34m[+] Buscando .iso y .ova en tus directorios...\e[0m"
+    
+    # Guardamos los hallazgos en una variable usando una lista limpia
+    local raw_images
+    raw_images=$(find_images)
+
+    if [[ -z "$raw_images" ]]; then
+        echo -e "\e[31m[!] No se encontraron archivos .iso o .ova en las rutas especificadas.\e[0m"
+        echo -e "\e[33mRutas revisadas:\e[0m"
+        printf ' - %s\n' "${ISO_SEARCH_DIRS[@]}"
+        read -rp "Presiona Enter..."
+        return
+    fi
+
+    IMAGE_PATH=$(echo "$raw_images" | fzf --prompt="Selecciona ISO u OVA: ")
+
     if [[ -z "$IMAGE_PATH" ]]; then
         echo -e "\e[31m[!] No se seleccionó ninguna imagen.\e[0m"
         read -rp "Presiona Enter..."
@@ -375,13 +466,13 @@ create_vm() {
             return
         fi
 
-        echo -e "\n\e[34m[+] Extrayendo paquete OVA multi-disco...\e[0m"
+        echo -e "\n\e[34m[+] Extrayendo OVA multi-disco...\e[0m"
         TMP_OVA_DIR=$(mktemp -d -t qemu4me-ova-XXXXXX)
         tar -xvf "$IMAGE_PATH" -C "$TMP_OVA_DIR"
 
         mapfile -t VMDK_FILES < <(find "$TMP_OVA_DIR" -type f -name "*.vmdk" | sort)
         if [ ${#VMDK_FILES[@]} -eq 0 ]; then
-            echo -e "\e[31m[!] No se encontraron discos .vmdk en el OVA.\e[0m"
+            echo -e "\e[31m[!] No se encontraron discos .vmdk dentro del paquete OVA.\e[0m"
             read -rp "Presiona Enter..."
             return
         fi
@@ -394,7 +485,8 @@ create_vm() {
             fi
             echo -e "  └─ Convirtiendo ($((idx+1))/${#VMDK_FILES[@]}): $(basename "$vmdk") -> $(basename "$target_qcow2")"
             qemu-img convert -f vmdk -O qcow2 "$vmdk" "$target_qcow2"
-            DRIVE_ARGS+="-drive file=\"$target_qcow2\",if=virtio,format=qcow2 "
+            
+            DRIVE_ARGS+="-drive file=\"$target_qcow2\",if=ide,index=$idx,media=disk,format=qcow2 "
         done
 
         rm -rf "$TMP_OVA_DIR"
@@ -410,13 +502,14 @@ create_vm() {
         DISCO_PATH="$VM_STORAGE_DIR/${VM_NAME}.qcow2"
         echo -e "\e[34m[+] Creando disco QCOW2 blanco...\e[0m"
         qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
-        DRIVE_ARGS="-drive file=\"$DISCO_PATH\",if=virtio,format=qcow2"
-        CDROM_ARG="-cdrom \"$IMAGE_PATH\" -boot order=d"
+        
+        DRIVE_ARGS="-drive file=\"$DISCO_PATH\",if=ide,index=0,media=disk,format=qcow2"
+        CDROM_ARG="-drive file=\"$IMAGE_PATH\",media=cdrom,index=1 -boot menu=on"
     fi
 
     configure_network
 
-    DISPLAY_CHOICE=$(echo -e "Default GTK/SDL GUI (-display default)\nHeadless / Sin GUI (-display none)\nVNC Server :1 (-vnc :1)" | fzf --prompt="Selecciona el modo de pantalla: ")
+    DISPLAY_CHOICE=$(echo -e "Default GTK/SDL GUI (-display default)\nHeadless / Sin GUI (-display none)\nVNC Server :1 (-vnc :1)" | fzf --prompt="Modo de Pantalla: ")
     case "$DISPLAY_CHOICE" in
         *"Headless"*) DEFAULT_DISPLAY="-display none" ;;
         *"VNC"*)      DEFAULT_DISPLAY="-vnc :1" ;;
@@ -426,21 +519,25 @@ create_vm() {
     MONITOR_SOCKET="$QMP_DIR/${VM_NAME}-monitor.sock"
     QMP_SOCKET="$QMP_DIR/${VM_NAME}-qmp.sock"
 
-    # Solicitar opción de captura PCAP nativa
-    read -rp "--> ¿Activar captura de tráfico PCAP nativa en QEMU? (s/N): " ENABLE_PCAP
+    read -rp "--> ¿Activar captura PCAP nativa? (s/N): " ENABLE_PCAP
     PCAP_ARG=""
     if [[ "$ENABLE_PCAP" =~ ^[Ss]$ ]]; then
         PCAP_PATH="$CONFIG_DIR/captures/${VM_NAME}_$(date +%Y%m%d_%H%M%S).pcap"
-        mkdir -p "$CONFIG_DIR/captures"
         PCAP_ARG="-object filter-dump,id=pcap0,netdev=net0,file=$PCAP_PATH"
     fi
+
+    # Buscar la ruta real del helper para inyectarla en la plantilla
+    HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
 
     VM_SCRIPT="$VM_CONFIG_DIR/${VM_NAME}.sh"
     cat <<EOF > "$VM_SCRIPT"
 #!/usr/bin/env bash
 
-# Limpiar sockets huérfanos antes de arrancar
 rm -f "$MONITOR_SOCKET" "$QMP_SOCKET"
+
+# Preservar entorno gráfico de la sesión de usuario
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$REAL_HOME/.Xauthority}"
 
 DISPLAY_OPT="$DEFAULT_DISPLAY"
 SNAPSHOT_OPT=""
@@ -467,17 +564,56 @@ exec qemu-system-x86_64 \\
     \$SNAPSHOT_OPT \\
     $DRIVE_ARGS \\
     $CDROM_ARG \\
-    $NET_ARGS \\
+    -netdev bridge,id=net0,br=$SELECTED_BRIDGE,helper=$HELPER_BIN \\
+    -device virtio-net-pci,netdev=net0,mac=$RAND_MAC \\
     $PCAP_ARG \\
     -monitor unix:"$MONITOR_SOCKET",server,nowait \\
     -qmp unix:"$QMP_SOCKET",server,nowait \\
-    -vga virtio \\
+    -vga std \\
     \$DISPLAY_OPT
 EOF
 
     chmod +x "$VM_SCRIPT"
-    echo -e "\e[32m[✓] VM '$VM_NAME' creada exitosamente.\e[0m"
-    read -rp "Presiona Enter..."
+    echo -e "\e[32m[✓] VM '$VM_NAME' registrada correctamente.\e[0m"
+
+    # Preguntar si desea iniciar la VM inmediatamente
+    read -rp "--> ¿Deseas arrancar la VM '$VM_NAME' ahora? (S/n): " START_NOW
+    START_NOW=${START_NOW:-S}
+
+    if [[ "$START_NOW" =~ ^[Ss]$ ]]; then
+        echo -e "\n\e[34m[+] Iniciando la VM '$VM_NAME' en segundo plano...\e[0m"
+        
+        # Arranca la VM usando la función existente
+        local log="$CONFIG_DIR/${VM_NAME}.log"
+        setsid nohup "$VM_SCRIPT" >"$log" 2>&1 < /dev/null &
+        sleep 3
+
+        # Comprobar el estado del proceso
+        if pgrep -f "qemu-system-x86_64.*-name $VM_NAME" >/dev/null; then
+            echo -e "\e[32m[✓] Estado: ACTIVA (PID: $(pgrep -f "qemu.*-name $VM_NAME" | head -1))\e[0m"
+            
+            # Intento de detección de IP con espera dinámica
+            echo -e "\e[34m[+] Esperando asignación de dirección IP (esto puede tardar unos segundos)...\e[0m"
+            local mac
+            mac=$(grep -o -E 'mac=[0-9A-Fa-f:]+' "$VM_SCRIPT" | cut -d'=' -f2 || echo "Desconocida")
+            
+            local ip_detected="No detectada"
+            for i in {1..10}; do
+                ip_detected=$(get_vm_ip_address "$mac")
+                if [[ "$ip_detected" != *"No detectada"* ]]; then
+                    break
+                fi
+                sleep 2
+            done
+            
+            echo -e "  ├─ MAC: \e[33m$mac\e[0m"
+            echo -e "  └─ IP Asignada: \e[32m$ip_detected\e[0m\n"
+        else
+            echo -e "\e[31m[!] La VM no pudo iniciarse correctamente. Revisa el log: $log\e[0m"
+        fi
+    fi
+
+    read -rp "Presiona Enter para continuar..."
 }
 
 show_vm_header() {
@@ -503,16 +639,16 @@ show_vm_header() {
 
     local status_socket
     if [[ -S "$monitor_socket" ]]; then
-        status_socket="\e[32mACTIVO (chmod 600)\e[0m"
+        status_socket="\e[32mACTIVO\e[0m"
     else
-        status_socket="\e[31mINACTIVO / LIMPIO\e[0m"
+        status_socket="\e[31mINACTIVO\e[0m"
     fi
 
     echo -e "  ├─ MAC: $mac"
     echo -e "  ├─ IP Asignada: \e[32m$vm_ip\e[0m"
     echo -e "  ├─ Hostfwd Activos: $hostfwd"
     echo -e "  ├─ Tamaño Disco Principal: $disk_size"
-    echo -e "  └─ Socket QMP/Monitor: $status_socket"
+    echo -e "  └─ Monitor QEMU: $status_socket"
     echo -e "\e[34m====================================================================\e[0m\n"
 }
 
@@ -521,7 +657,7 @@ qmp_control_menu() {
     local monitor_socket="$QMP_DIR/${vm_name}-monitor.sock"
 
     if [[ ! -S "$monitor_socket" ]]; then
-        echo -e "\e[31m[!] El socket de monitor QEMU no está activo. ¿Está la VM en ejecución?\e[0m"
+        echo -e "\e[31m[!] El socket del monitor no está activo. ¿Está corriendo la VM?\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
@@ -529,21 +665,20 @@ qmp_control_menu() {
     while true; do
         show_logo
         show_vm_header "$vm_name"
-        echo -e "\e[33m--- Control Monitor QEMU (QMP/Monitor) ---\e[0m\n"
-        CMD_CHOICE=$(echo -e "1. Pausar VM (stop)\n2. Reanudar VM (cont)\n3. Forzar Reinicio (system_reset)\n4. Generar Memory Dump\n5. Consola Monitor Interactiva\n6. Volver" | fzf --prompt="Comando QEMU: ")
+        echo -e "\e[33m--- Control Monitor QEMU (QMP) ---\e[0m\n"
+        CMD_CHOICE=$(echo -e "1. Pausar VM (stop)\n2. Reanudar VM (cont)\n3. Reiniciar (system_reset)\n4. Memory Dump\n5. Consola Interactiva\n6. Volver" | fzf --prompt="Comando: ")
 
         case "$CMD_CHOICE" in
             1*) send_qmp_cmd "$monitor_socket" "stop" ;;
             2*) send_qmp_cmd "$monitor_socket" "cont" ;;
             3*) send_qmp_cmd "$monitor_socket" "system_reset" ;;
             4*) 
-                read -rp "--> Ruta para guardar el Dump de memoria: " DUMP_PATH
+                read -rp "--> Ruta de guardado para el Dump: " DUMP_PATH
                 send_qmp_cmd "$monitor_socket" "pmemsave 0 0x10000000 $DUMP_PATH"
-                echo -e "\e[32m[✓] Comando de descarga de memoria enviado.\e[0m"
+                echo -e "\e[32m[✓] Dump enviado.\e[0m"
                 read -rp "Presiona Enter..."
                 ;;
             5*)
-                echo -e "\e[34m[+] Conectando a la consola monitor QEMU. Usa Ctrl+C para salir.\e[0m"
                 if command -v socat &>/dev/null; then
                     socat - "UNIX-CONNECT:$monitor_socket" || true
                 else
@@ -561,7 +696,7 @@ quick_access_menu() {
 
     show_logo
     show_vm_header "$vm_name"
-    echo -e "\e[33m--- Atajos de Teclado y Acceso Rápido ---\e[0m\n"
+    echo -e "\e[33m--- Atajos y Acceso Rápido ---\e[0m\n"
 
     local fwd_rules
     fwd_rules=$(grep -o -E 'hostfwd=[^ ]+' "$script_path" | cut -d'=' -f2 || true)
@@ -578,11 +713,11 @@ quick_access_menu() {
         done <<< "$fwd_rules"
     fi
 
-    labels+=("Copiar comando de ejecucion QEMU directo")
+    labels+=("Copiar comando de ejecución directo")
     cmds+=("$script_path")
 
     local CHOICE
-    CHOICE=$(printf "%s\n" "${labels[@]}" | fzf --prompt="Selecciona Acción Rápida: ")
+    CHOICE=$(printf "%s\n" "${labels[@]}" | fzf --prompt="Selecciona Acción: ")
     [[ -z "$CHOICE" ]] && return
 
     for idx in "${!labels[@]}"; do
@@ -597,18 +732,16 @@ quick_access_menu() {
 export_bundle() {
     local vm_name="$1"
     show_logo
-    echo -e "\e[33m--- Exportar Bundle de VM (Lab Pentesting) ---\e[0m\n"
+    echo -e "\e[33m--- Exportar Bundle de VM (.tar.gz) ---\e[0m\n"
 
     local export_tar="$HOME/${vm_name}_bundle.tar.gz"
-    echo -e "\e[34m[+] Empaquetando VM '$vm_name' en $export_tar...\e[0m"
-
     local files_to_pack=("$VM_CONFIG_DIR/${vm_name}.sh")
     for d in "$VM_STORAGE_DIR/${vm_name}"*.qcow2; do
         [[ -f "$d" ]] && files_to_pack+=("$d")
     done
 
     tar -czvf "$export_tar" "${files_to_pack[@]}"
-    echo -e "\e[32m[✓] Bundle creado exitosamente: $export_tar\e[0m"
+    echo -e "\e[32m[✓] Bundle exportado en: $export_tar\e[0m"
     read -rp "Presiona Enter..."
 }
 
@@ -616,22 +749,21 @@ import_bundle() {
     show_logo
     echo -e "\e[33m--- Importar Bundle de VM (.tar.gz) ---\e[0m\n"
 
-    read -rp "--> Ruta completa del archivo .tar.gz: " BUNDLE_PATH
+    read -rp "--> Ruta completa del .tar.gz: " BUNDLE_PATH
     if [[ ! -f "$BUNDLE_PATH" ]]; then
-        echo -e "\e[31m[!] El archivo especificado no existe.\e[0m"
+        echo -e "\e[31m[!] El archivo no existe.\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
 
-    echo -e "\e[34m[+] Extrayendo bundle en el sistema local...\e[0m"
     tar -xzvf "$BUNDLE_PATH" -C /
-    echo -e "\e[32m[✓] Importación completada. La VM ya está disponible en tu lista.\e[0m"
+    echo -e "\e[32m[✓] Importación completada.\e[0m"
     read -rp "Presiona Enter..."
 }
 
 clone_vm() {
     show_logo
-    echo -e "\e[33m--- Clonación Rápida de VMs (Linked Clones QCow2) ---\e[0m\n"
+    echo -e "\e[33m--- Clonación Rápida (Linked Clone) ---\e[0m\n"
 
     local VMS=()
     while IFS= read -r file; do
@@ -639,32 +771,30 @@ clone_vm() {
     done < <(find "$VM_CONFIG_DIR" -name "*.sh" 2>/dev/null)
 
     if [ ${#VMS[@]} -eq 0 ]; then
-        echo -e "\e[31m[!] No hay máquinas virtuales registradas.\e[0m"
+        echo -e "\e[31m[!] No hay VMs registradas.\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
 
-    SRC_VM=$(printf "%s\n" "${VMS[@]}" | fzf --prompt="Selecciona VM Base (Origen): ")
+    SRC_VM=$(printf "%s\n" "${VMS[@]}" | fzf --prompt="Selecciona VM Origen: ")
     [[ -z "$SRC_VM" ]] && return
 
     SRC_DISK="$VM_STORAGE_DIR/${SRC_VM}.qcow2"
     if [[ ! -f "$SRC_DISK" ]]; then
-        echo -e "\e[31m[!] El disco base de $SRC_VM no existe en $SRC_DISK\e[0m"
+        echo -e "\e[31m[!] Disco base no encontrado: $SRC_DISK\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
 
-    read -rp "--> Nombre del Nuevo Clon: " RAW_CLONE
+    read -rp "--> Nombre del Clon: " RAW_CLONE
     CLONE_NAME=$(sanitize_name "$RAW_CLONE")
     if [[ -z "$CLONE_NAME" || -f "$VM_CONFIG_DIR/${CLONE_NAME}.sh" ]]; then
-        echo -e "\e[31m[!] Nombre de clon inválido o ya existente.\e[0m"
+        echo -e "\e[31m[!] Nombre inválido o ya existente.\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
 
     CLONE_DISK="$VM_STORAGE_DIR/${CLONE_NAME}.qcow2"
-    
-    echo -e "\e[34m[+] Creando Linked Clone con Backing File QCOW2...\e[0m"
     qemu-img create -f qcow2 -b "$SRC_DISK" -F qcow2 "$CLONE_DISK"
 
     RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
@@ -677,7 +807,7 @@ clone_vm() {
         "$VM_CONFIG_DIR/${SRC_VM}.sh" > "$VM_CONFIG_DIR/${CLONE_NAME}.sh"
 
     chmod +x "$VM_CONFIG_DIR/${CLONE_NAME}.sh"
-    echo -e "\e[32m[✓] ¡Clon vinculado '$CLONE_NAME' creado al instante!\e[0m"
+    echo -e "\e[32m[✓] Clon vinculado '$CLONE_NAME' creado exitosamente.\e[0m"
     read -rp "Presiona Enter..."
 }
 
@@ -687,26 +817,26 @@ attach_resources() {
 
     show_logo
     show_vm_header "$vm_name"
-    echo -e "\e[33m--- Gestión de Discos e ISOs Secundarias ---\e[0m\n"
-    RESOURCE_ACTION=$(echo -e "1. Adjuntar Disco Secundario QCOW2\n2. Adjuntar Imagen ISO (CDROM)\n3. Volver" | fzf --prompt="Acción: ")
+    echo -e "\e[33m--- Gestión de Recursos (Discos e ISOs) ---\e[0m\n"
+    RESOURCE_ACTION=$(echo -e "1. Adjuntar Disco Secundario QCOW2\n2. Adjuntar CD-ROM / ISO\n3. Volver" | fzf --prompt="Acción: ")
 
     case "$RESOURCE_ACTION" in
         1*)
-            read -rp "--> Nombre o identificador del disco extra: " DISK_LABEL
+            read -rp "--> Identificador del disco extra: " DISK_LABEL
             DISK_LABEL=$(sanitize_name "$DISK_LABEL")
             SEC_SIZE=$(select_disk_size)
             SEC_DISK_PATH="$VM_STORAGE_DIR/${vm_name}-${DISK_LABEL}.qcow2"
             
             qemu-img create -f qcow2 "$SEC_DISK_PATH" "${SEC_SIZE}G"
             sed -i "/exec qemu-system-x86_64/a \    -drive file=\"$SEC_DISK_PATH\",if=virtio,format=qcow2 \\\\" "$script_path"
-            echo -e "\e[32m[✓] Disco secundario añadido al script ejecutable.\e[0m"
+            echo -e "\e[32m[✓] Disco secundario añadido.\e[0m"
             read -rp "Presiona Enter..."
             ;;
         2*)
-            ISO_PATH=$(find "$ISO_SEARCH_DIR" -type f -name "*.iso" 2>/dev/null | fzf --prompt="Selecciona ISO Secundaria: ")
+            ISO_PATH=$(find_images | fzf --prompt="Selecciona ISO Secundaria: ")
             if [[ -n "$ISO_PATH" ]]; then
                 sed -i "/exec qemu-system-x86_64/a \    -drive file=\"$ISO_PATH\",media=cdrom \\\\" "$script_path"
-                echo -e "\e[32m[✓] ISO asignada correctamente como CD-ROM secundario.\e[0m"
+                echo -e "\e[32m[✓] ISO vinculada como CD-ROM.\e[0m"
             fi
             read -rp "Presiona Enter..."
             ;;
@@ -719,7 +849,7 @@ manage_snapshots() {
     local primary_disk="$VM_STORAGE_DIR/${vm_name}.qcow2"
 
     if [[ ! -f "$primary_disk" ]]; then
-        echo -e "\e[31m[!] No se encontró el disco principal para instantáneas: $primary_disk\e[0m"
+        echo -e "\e[31m[!] No se encontró el disco principal para instantáneas.\e[0m"
         read -rp "Presiona Enter..."
         return
     fi
@@ -729,7 +859,7 @@ manage_snapshots() {
         show_vm_header "$vm_name"
         echo -e "\e[33m--- Gestión de Snapshots ---\e[0m\n"
         
-        SNAP_ACTION=$(echo -e "1. Crear Snapshot\n2. Listar Snapshots\n3. Restaurar Snapshot\n4. Eliminar Snapshot\n5. Volver" | fzf --prompt="Selecciona acción de Snapshot: ")
+        SNAP_ACTION=$(echo -e "1. Crear Snapshot\n2. Listar Snapshots\n3. Restaurar Snapshot\n4. Eliminar Snapshot\n5. Volver" | fzf --prompt="Acción: ")
 
         case "$SNAP_ACTION" in
             1*)
@@ -737,12 +867,12 @@ manage_snapshots() {
                 SNAP_NAME=$(sanitize_name "$RAW_SNAP")
                 if [[ -n "$SNAP_NAME" ]]; then
                     qemu-img snapshot -c "$SNAP_NAME" "$primary_disk"
-                    echo -e "\e[32m[✓] Snapshot '$SNAP_NAME' creado correctamente.\e[0m"
+                    echo -e "\e[32m[✓] Snapshot '$SNAP_NAME' creado.\e[0m"
                 fi
                 read -rp "Presiona Enter..."
                 ;;
             2*)
-                echo -e "\e[34m[+] Instantáneas en $primary_disk:\e[0m"
+                echo -e "\e[34m[+] Snapshots en disco:\e[0m"
                 qemu-img snapshot -l "$primary_disk" || echo "Sin snapshots."
                 read -rp "Presiona Enter..."
                 ;;
@@ -751,10 +881,10 @@ manage_snapshots() {
                 if [ ${#SNAPS[@]} -eq 0 ]; then
                     echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
                 else
-                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Snapshot a restaurar: ")
+                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Restaurar: ")
                     if [[ -n "$TARGET_SNAP" ]]; then
                         qemu-img snapshot -a "$TARGET_SNAP" "$primary_disk"
-                        echo -e "\e[32m[✓] Disco restaurado al snapshot '$TARGET_SNAP'.\e[0m"
+                        echo -e "\e[32m[✓] Snapshot restaurado.\e[0m"
                     fi
                 fi
                 read -rp "Presiona Enter..."
@@ -762,12 +892,12 @@ manage_snapshots() {
             4*)
                 mapfile -t SNAPS < <(qemu-img snapshot -l "$primary_disk" | tail -n +3 | awk '{print $2}')
                 if [ ${#SNAPS[@]} -eq 0 ]; then
-                    echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
+                    echo -e "\e[31m[!] No hay snapshots disponiles.\e[0m"
                 else
-                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Snapshot a eliminar: ")
+                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Eliminar: ")
                     if [[ -n "$TARGET_SNAP" ]]; then
                         qemu-img snapshot -d "$TARGET_SNAP" "$primary_disk"
-                        echo -e "\e[31m[✓] Snapshot '$TARGET_SNAP' eliminado.\e[0m"
+                        echo -e "\e[31m[✓] Snapshot eliminado.\e[0m"
                     fi
                 fi
                 read -rp "Presiona Enter..."
@@ -788,7 +918,7 @@ manage_vms() {
 
     if [ ${#VMS[@]} -eq 0 ]; then
         echo -e "\e[31m[!] No hay máquinas virtuales registradas.\e[0m"
-        read -rp "Presiona Enter para continuar..."
+        read -rp "Presiona Enter..."
         return
     fi
 
@@ -799,47 +929,21 @@ manage_vms() {
         show_logo
         show_vm_header "$SELECTED_VM"
 
-        ACTION=$(echo -e "Arrancar (GUI)\nArrancar Sandbox / Read-Only (-snapshot)\nArrancar (VNC Server :1)\nArrancar (Headless / Sin GUI)\nAcceso Rapido / Copiar Comandos\nControl QMP / Monitor\nGestionar Snapshots\nAdjuntar Discos/ISOs\nExportar Bundle (.tar.gz)\nApagar Forzado (Kill)\nEliminar VM (Script + Discos)\nVolver" | fzf --prompt="Acción [$SELECTED_VM]: ")
+        ACTION=$(echo -e "Arrancar (GUI)\nArrancar Sandbox / Read-Only (-snapshot)\nArrancar (VNC Server :1)\nArrancar (Headless / Sin GUI)\nAcceso Rápido / Copiar Comandos\nControl QMP / Monitor\nGestionar Snapshots\nAdjuntar Discos/ISOs\nExportar Bundle (.tar.gz)\nApagar Forzado (Kill)\nEliminar VM (Script + Discos)\nVolver" | fzf --prompt="Acción [$SELECTED_VM]: ")
 
         case "$ACTION" in
-            *"Arrancar (GUI)"*)
-                "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --gui &
-                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada con GUI.\e[0m"
-                read -rp "Presiona Enter..."
-                ;;
-            *"Sandbox"*)
-                "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --snapshot --gui &
-                echo -e "\e[33m[✓] VM '$SELECTED_VM' iniciada en MODO SANDBOX (Cambios no se guardarán).\e[0m"
-                read -rp "Presiona Enter..."
-                ;;
-            *"Arrancar (VNC"*)
-                "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --vnc &
-                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en modo VNC (Puerto 5901 / :1).\e[0m"
-                read -rp "Presiona Enter..."
-                ;;
-            *"Arrancar (Headless"*)
-                "$VM_CONFIG_DIR/${SELECTED_VM}.sh" --headless &
-                echo -e "\e[32m[✓] VM '$SELECTED_VM' iniciada en segundo plano (Headless).\e[0m"
-                read -rp "Presiona Enter..."
-                ;;
-            *"Acceso Rapido"*)
-                quick_access_menu "$SELECTED_VM"
-                ;;
-            *"Control QMP"*)
-                qmp_control_menu "$SELECTED_VM"
-                ;;
-            *"Snapshots"*)
-                manage_snapshots "$SELECTED_VM"
-                ;;
-            *"Adjuntar"*)
-                attach_resources "$SELECTED_VM"
-                ;;
-            *"Exportar"*)
-                export_bundle "$SELECTED_VM"
-                ;;
+            *"Arrancar (GUI)"*)       launch_vm "$SELECTED_VM" --gui ;;
+            *"Sandbox"*)              launch_vm "$SELECTED_VM" --snapshot --gui ;;
+            *"Arrancar (VNC"*)        launch_vm "$SELECTED_VM" --vnc ;;
+            *"Arrancar (Headless"*)   launch_vm "$SELECTED_VM" --headless ;;
+            *"Acceso Rápido"*)       quick_access_menu "$SELECTED_VM" ;;
+            *"Control QMP"*)          qmp_control_menu "$SELECTED_VM" ;;
+            *"Snapshots"*)            manage_snapshots "$SELECTED_VM" ;;
+            *"Adjuntar"*)             attach_resources "$SELECTED_VM" ;;
+            *"Exportar"*)             export_bundle "$SELECTED_VM" ;;
             *"Apagar"*)
                 if pkill -f "qemu-system-x86_64.*-name $SELECTED_VM"; then
-                    echo -e "\e[33m[!] Proceso QEMU finalizado.\e[0m"
+                    echo -e "\e[33m[!] Proceso detenido correctamente.\e[0m"
                     rm -f "$QMP_DIR/${SELECTED_VM}"*.sock
                 else
                     echo -e "\e[31m[!] La VM no estaba en ejecución.\e[0m"
@@ -847,13 +951,13 @@ manage_vms() {
                 read -rp "Presiona Enter..."
                 ;;
             *"Eliminar"*)
-                read -rp "¿Confirmas eliminar '$SELECTED_VM' y TODOS sus discos asociados? (s/N): " CONF
+                read -rp "¿Confirmas eliminar '$SELECTED_VM' y TODOS sus discos? (s/N): " CONF
                 if [[ "$CONF" =~ ^[Ss]$ ]]; then
                     pkill -f "qemu-system-x86_64.*-name $SELECTED_VM" 2>/dev/null || true
                     rm -f "$VM_CONFIG_DIR/${SELECTED_VM}.sh"
                     rm -f "$VM_STORAGE_DIR/${SELECTED_VM}"*.qcow2
                     rm -f "$QMP_DIR/${SELECTED_VM}"*.sock
-                    echo -e "\e[31m[✓] VM y discos asociados eliminados.\e[0m"
+                    echo -e "\e[31m[✓] VM eliminada.\e[0m"
                     read -rp "Presiona Enter..."
                     break
                 fi
@@ -867,14 +971,13 @@ main_menu() {
     check_and_install_dependencies
     while true; do
         show_logo
-        MENU_OPTION=$(echo -e "1. Crear nueva VM vulnerable (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Clonar VM Rápida (Linked Clone)\n4. Importar Bundle de VM (.tar.gz)\n5. Salir" | fzf --prompt="Selecciona: ")
+        MENU_OPTION=$(echo -e "1. Crear nueva VM vulnerable (ISO / OVA)\n2. Gestionar / Listar VMs\n3. Clonar VM Rápida (Linked Clone)\n4. Importar Bundle de VM (.tar.gz)\n5. Salir" | fzf --prompt="Selecciona Opción: ")
         case "$MENU_OPTION" in
             1*) create_vm ;;
             2*) manage_vms ;;
             3*) clone_vm ;;
             4*) import_bundle ;;
-            5*) exit 0 ;;
-            *) exit 0 ;;
+            5*|*) break ;;
         esac
     done
 }
