@@ -269,8 +269,8 @@ check_and_install_dependencies() {
 
     case "$DISTRO" in
         arch)
-            for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip dnsmasq tcpdump; do
-                pacman -Qq "$pkg" &>/dev/null || MISSING+=("$pkg")
+            for pkg in qemu-desktop fzf gawk tar iproute2 openbsd-netcat socat xclip dnsmasq; do
+                pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
                 echo -e "\e[33m[!] Instalando paquetes faltantes en Arch Linux: ${MISSING[*]}\e[0m"
@@ -278,16 +278,16 @@ check_and_install_dependencies() {
             fi
             ;;
         fedora)
-            for pkg in qemu-kvm fzf gawk tar iproute nc socat xclip dnsmasq tcpdump; do
+            for pkg in qemu-kvm fzf gawk tar iproute nc socat xclip dnsmasq; do
                 rpm -q "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
-                echo -e "\e[33m[!] Instalando paquetes faltantes en Fedora: ${MISSING[*]}\e[0m"
+                echo -e "\e[33m[!] Instalando paquetes faltantes en Fedora: ${MISSING[@]}\e[0m"
                 sudo dnf install -y "${MISSING[@]}"
             fi
             ;;
         debian)
-            for pkg in qemu-system-x86 fzf gawk tar iproute2 netcat-openbsd socat xclip dnsmasq tcpdump; do
+            for pkg in qemu-system-x86 fzf gawk tar iproute2 netcat-openbsd socat xclip dnsmasq; do
                 dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
             done
             if [ ${#MISSING[@]} -gt 0 ]; then
@@ -297,7 +297,6 @@ check_and_install_dependencies() {
             ;;
     esac
 
-    # Cargar módulo tun/tap si no está presente
     if ! lsmod | grep -q "^tun"; then
         echo -e "\e[34m[+] Cargando módulo del kernel 'tun'...\e[0m"
         sudo modprobe tun
@@ -315,15 +314,31 @@ check_and_install_dependencies() {
         echo -e "\e[32m[✓] Persistencia de 'tun' configurada en /etc/modules-load.d/qemu4me-tun.conf\e[0m"
     fi
 
-    # Cargar módulos KVM
-    if ! lsmod | grep -q kvm; then
-        echo -e "\e[34m[+] Cargando módulos KVM...\e[0m"
-        sudo modprobe kvm 2>/dev/null || true
-        sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
+    if [[ ! -f /etc/qemu/bridge.conf ]]; then
+        echo -e "\e[34m[+] Habilitando permisos en /etc/qemu/bridge.conf...\e[0m"
+        sudo mkdir -p /etc/qemu
+        echo "allow all" | sudo tee /etc/qemu/bridge.conf >/dev/null
+        sudo chmod 640 /etc/qemu/bridge.conf
+    elif ! grep -q "allow all" /etc/qemu/bridge.conf; then
+        echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
+    fi
+
+    local HELPER_BIN
+    HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
+
+    if [[ -n "$HELPER_BIN" && -f "$HELPER_BIN" ]]; then
+        sudo chown root:root "$HELPER_BIN" 2>/dev/null || true
+        sudo chmod 4755 "$HELPER_BIN" 2>/dev/null || true
     fi
 
     if [[ -n "${DISPLAY:-}" ]] && command -v xhost &>/dev/null; then
         xhost +si:localuser:root &>/dev/null || xhost +local:root &>/dev/null || true
+    fi
+
+    if ! lsmod | grep -q kvm; then
+        echo -e "\e[34m[+] Cargando módulos KVM...\e[0m"
+        sudo modprobe kvm 2>/dev/null || true
+        sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
     fi
 
     echo -e "\e[32m[✓] Entorno del sistema verificado y preparado correctamente.\e[0m\n"
@@ -335,61 +350,29 @@ get_bridge_interfaces() {
 
 setup_lab_bridge() {
     local bridge_name="${1:-br-lab}"
-    local tap_name="${2:-tap-lab}"
-    local bridge_ip="${3:-192.168.100.1/24}"
-    local dhcp_start="${4:-192.168.100.10}"
-    local dhcp_end="${5:-192.168.100.100}"
+    local bridge_ip="${2:-192.168.100.1/24}"
+    local dhcp_start="${3:-192.168.100.10}"
+    local dhcp_end="${4:-192.168.100.100}"
 
-    # 1. Habilitar Forwarding IPv4 en el Kernel
-    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-
-    # 2. Crear Bridge L2 y asignar IP de Gateway Host
     if ! ip link show dev "$bridge_name" &>/dev/null; then
         sudo ip link add name "$bridge_name" type bridge
         sudo ip addr add "$bridge_ip" dev "$bridge_name"
         sudo ip link set dev "$bridge_name" up
     fi
 
-    # 3. Crear Interfaz TAP y asociarla al Bridge ANTES de iniciar dnsmasq
-    if ! ip link show dev "$tap_name" &>/dev/null; then
-        sudo ip tuntap add dev "$tap_name" mode tap user "$REAL_USER"
-        sudo ip link set dev "$tap_name" master "$bridge_name"
-        sudo ip link set dev "$tap_name" up
-    fi
-
-    # 4. Reglas Permisivas de Firewall (Iptables / UFW) para Tráfico de Laboratorio
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-        sudo ufw allow in on "$bridge_name" >/dev/null 2>&1
-        sudo ufw route allow in on "$bridge_name" >/dev/null 2>&1
-    fi
-    sudo iptables -C FORWARD -i "$bridge_name" -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$bridge_name" -j ACCEPT
-    sudo iptables -C FORWARD -o "$bridge_name" -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -o "$bridge_name" -j ACCEPT
-
-    # 5. Inicializar Dnsmasq escuchando estrictamente en el Bridge L2
     if command -v dnsmasq &>/dev/null; then
-        local lease_file="/tmp/dnsmasq-$bridge_name.leases"
-        local pid_file="/tmp/dnsmasq-$bridge_name.pid"
-
-        if ! pgrep -F "$pid_file" &>/dev/null; then
-            sudo touch "$lease_file"
-            sudo chmod 666 "$lease_file"
-            sudo dnsmasq \
-                --interface="$bridge_name" \
-                --bind-interfaces \
-                --except-interface=lo \
-                --dhcp-range="$dhcp_start,$dhcp_end,12h" \
-                --dhcp-leasefile="$lease_file" \
-                --pid-file="$pid_file" 2>/dev/null || true
+        if ! pgrep -f "dnsmasq.*$bridge_name" &>/dev/null; then
+            sudo dnsmasq --interface="$bridge_name" \
+                         --bind-interfaces \
+                         --dhcp-range="$dhcp_start,$dhcp_end,12h" \
+                         --pid-file="/tmp/dnsmasq-$bridge_name.pid" 2>/dev/null || true
         fi
     fi
-
-    echo "$tap_name"
+    echo "$bridge_name"
 }
 
 get_vm_ip_address() {
     local mac_addr="$1"
-    local bridge_dev="${2:-br-lab}"
-
     if [[ -z "$mac_addr" || "$mac_addr" == "Desconocida" ]]; then
         echo "No detectada"
         return
@@ -399,46 +382,29 @@ get_vm_ip_address() {
     mac_lower=$(echo "$mac_addr" | tr '[:upper:]' '[:lower:]')
     local ip_found=""
 
-    # CAPA 1: Inspección directa en los archivos Lease de dnsmasq
-    local lease_files=(
-        "/tmp/dnsmasq-${bridge_dev}.leases"
-        /tmp/dnsmasq*.leases
-        /var/lib/misc/dnsmasq.leases
-    )
-    for lf in "${lease_files[@]}"; do
-        if [[ -f "$lf" ]]; then
-            ip_found=$(grep -i "$mac_lower" "$lf" 2>/dev/null | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
-            [[ -n "$ip_found" ]] && { echo "$ip_found"; return; }
-        fi
-    done
+    ip_found=$(ip neighbor show | grep -i "$mac_lower" | awk '{print $1}' | head -n1)
 
-    # CAPA 2: Ping Broadcast al Rango de Red + Inspección de la Tabla Neighbor/ARP del Kernel
-    local subnet_prefix
-    subnet_prefix=$(ip -4 addr show dev "$bridge_dev" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
-
-    if [[ -n "$subnet_prefix" ]]; then
-        local bcast_ip
-        bcast_ip=$(ipcalc -b "$subnet_prefix" 2>/dev/null | cut -d'=' -f2 || echo "")
-        [[ -z "$bcast_ip" ]] && bcast_ip="${subnet_prefix%.*}.255"
-
-        # Inyección pasiva/activa de ICMP para forzar la actualización de tablas L2
-        ping -c 2 -b -I "$bridge_dev" "$bcast_ip" >/dev/null 2>&1 || true
-
-        ip_found=$(ip neighbor show dev "$bridge_dev" | grep -i "$mac_lower" | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
-        [[ -n "$ip_found" ]] && { echo "$ip_found"; return; }
+    if [[ -z "$ip_found" ]]; then
+        local lease_files=(
+            /var/lib/misc/dnsmasq.leases
+            /var/lib/dhcp/dhcpd.leases
+            /var/lib/NetworkManager/*.lease
+            /var/lib/systemd/network/*.lease
+            /tmp/dnsmasq*.leases
+        )
+        for lf in "${lease_files[@]}"; do
+            if [[ -f "$lf" ]]; then
+                ip_found=$(grep -i "$mac_lower" "$lf" 2>/dev/null | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+                [[ -n "$ip_found" ]] && break
+            fi
+        done
     fi
 
-    # CAPA 3: Escaneo Activo L2 (arp-scan / nmap) filtrando por MAC persistente
-    if [[ -n "$subnet_prefix" ]]; then
-        if command -v arp-scan &>/dev/null; then
-            ip_found=$(sudo arp-scan --interface="$bridge_dev" "$subnet_prefix" 2>/dev/null | grep -i "$mac_lower" | awk '{print $1}' | head -n1 || true)
-        elif command -v nmap &>/dev/null; then
-            ip_found=$(sudo nmap -sn -PR --send-eth -e "$bridge_dev" "$subnet_prefix" 2>/dev/null | grep -B 2 -i "$mac_lower" | grep -oP '(\d{1,3}\.){3}\d{1,3}' | head -n1 || true)
-        fi
-        [[ -n "$ip_found" ]] && { echo "$ip_found"; return; }
+    if [[ -n "$ip_found" ]]; then
+        echo "$ip_found"
+    else
+        echo "No detectada (Offline/Buscando...)"
     fi
-
-    echo "No detectada (Offline/Buscando...)"
 }
 
 select_ram() {
@@ -516,30 +482,28 @@ select_disk_size() {
     esac
 }
 
-# Lógica de extracción/asignación dentro del flujo de creación de VM
 configure_network() {
     echo -e "\n\e[34m[+] Modo de red:\e[0m"
     NET_MODE=$(echo -e "1. Bridge Aislado br-lab (Wi-Fi)\n2. Bridge Existente\n3. User/NAT + hostfwd" \
-               | fzf --prompt="Red: ")
+               | fzf --prompt="Red: " \
+               --preview='case {} in
+                   1*) echo -e "Bridge Aislado (br-lab):\n - Crea un puente aislado con DHCP propio (192.168.100.x).\n - Ideal para entornos Wi-Fi o laboratorios totalmente aislados." ;;
+                   2*) echo -e "Bridge Existente:\n - Asocia la máquina a una interfaz bridge previamente creada en el host." ;;
+                   3*) echo -e "User/NAT + hostfwd:\n - Utiliza la red de usuario nativa de QEMU con reenvío de puertos configurables (ej. 2222->22)." ;;
+               esac' \
+               --preview-window=right:50%:wrap)
 
-    # Si se extrajo previamente del .ovf se mantiene; si no, se fija con prefijo QEMU OUI (52:54:00)
-    if [[ -n "${EXTRACTED_MAC:-}" ]]; then
-        FINAL_MAC=$(echo "$EXTRACTED_MAC" | tr -cd '0-9A-Fa-f:')
-    else
-        FINAL_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
-    fi
+    RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
 
     if [[ "$NET_MODE" =~ Aislado ]]; then
-        TAP_DEV=$(setup_lab_bridge "br-lab" "tap-lab")
-        NET_ARGS="-netdev tap,id=net0,ifname=$TAP_DEV,script=no,downscript=no -device e1000,netdev=net0,mac=$FINAL_MAC"
+        SELECTED_BRIDGE=$(setup_lab_bridge)
+        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     elif [[ "$NET_MODE" =~ Existente ]]; then
         BRIDGES=$(get_bridge_interfaces)
         SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Bridge: ")
         [[ -z "$SELECTED_BRIDGE" ]] && SELECTED_BRIDGE="br-lab"
         SELECTED_BRIDGE=$(sanitize_name "$SELECTED_BRIDGE")
-
-        TAP_DEV=$(setup_lab_bridge "$SELECTED_BRIDGE" "tap-$SELECTED_BRIDGE")
-        NET_ARGS="-netdev tap,id=net0,ifname=$TAP_DEV,script=no,downscript=no -device e1000,netdev=net0,mac=$FINAL_MAC"
+        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     else
         read -rp "--> hostfwd (ej: tcp::2222-:22): " FWD_RULES
         local fwd=""
@@ -548,7 +512,7 @@ configure_network() {
             IFS=',' read -ra ADDR <<< "$FWD_RULES"
             for i in "${ADDR[@]}"; do fwd+=",hostfwd=$i"; done
         fi
-        NET_ARGS="-netdev user,id=net0${fwd} -device e1000,netdev=net0,mac=$FINAL_MAC"
+        NET_ARGS="-netdev user,id=net0${fwd} -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
     fi
 }
 
@@ -612,7 +576,6 @@ create_vm() {
     DRIVE_ARGS=""
     CDROM_ARG=""
 
-    EXTRACTED_MAC=""
     if [[ "$IMAGE_PATH" == *.ova ]]; then
         local file_size
         file_size=$(stat -c%s "$IMAGE_PATH" 2>/dev/null || stat -f%z "$IMAGE_PATH")
@@ -622,22 +585,9 @@ create_vm() {
             return
         fi
 
-        echo -e "\n\e[34m[+] Extrayendo OVA y parseando OVF...\e[0m"
+        echo -e "\n\e[34m[+] Extrayendo OVA multi-disco...\e[0m"
         TMP_OVA_DIR=$(mktemp -d -t qemu4me-ova-XXXXXX)
         tar -xvf "$IMAGE_PATH" -C "$TMP_OVA_DIR"
-
-        # Intentar extraer la MAC persistente del archivo .ovf
-        local ovf_file
-        ovf_file=$(find "$TMP_OVA_DIR" -type f -name "*.ovf" | head -n1)
-        if [[ -n "$ovf_file" && -f "$ovf_file" ]]; then
-            local raw_mac
-            raw_mac=$(grep -iP 'MACAddress="?\K[0-9A-Fa-f]{12}' "$ovf_file" | head -n1 || true)
-            if [[ -n "$raw_mac" ]]; then
-                # ASEGÚRATE DE LIMPIAR CUALQUIER CARACTER EXTRAÑO O ESPACIO
-                EXTRACTED_MAC=$(echo "$raw_mac" | tr -cd '0-9A-Fa-f' | sed -E 's/(..)/\1:/g; s/:$//' | tr '[:upper:]' '[:lower:]')
-                echo -e "\e[32m[✓] MAC Original extraída del OVF: $EXTRACTED_MAC\e[0m"
-            fi
-        fi
 
         mapfile -t VMDK_FILES < <(find "$TMP_OVA_DIR" -type f -name "*.vmdk" | sort)
         if [ ${#VMDK_FILES[@]} -eq 0 ]; then
@@ -660,6 +610,20 @@ create_vm() {
 
         rm -rf "$TMP_OVA_DIR"
         TMP_OVA_DIR=""
+    else
+        DISK_SIZE=$(select_disk_size)
+        local req_space=$(( DISK_SIZE * 1073741824 ))
+        if ! check_free_space "$VM_STORAGE_DIR" "$req_space"; then
+            read -rp "Presiona Enter..."
+            return
+        fi
+
+        DISCO_PATH="$VM_STORAGE_DIR/${VM_NAME}.qcow2"
+        echo -e "\e[34m[+] Creando disco QCOW2 blanco...\e[0m"
+        qemu-img create -f qcow2 "$DISCO_PATH" "${DISK_SIZE}G"
+        
+        DRIVE_ARGS="-drive file=\"$DISCO_PATH\",if=ide,index=0,media=disk,format=qcow2"
+        CDROM_ARG="-drive file=\"$IMAGE_PATH\",media=cdrom,index=1 -boot menu=on"
     fi
 
     configure_network
@@ -695,8 +659,8 @@ create_vm() {
 
 rm -f "$MONITOR_SOCKET" "$QMP_SOCKET"
 
-export DISPLAY="\${DISPLAY:-:0}"
-export XAUTHORITY="\${XAUTHORITY:-$REAL_HOME/.Xauthority}"
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$REAL_HOME/.Xauthority}"
 
 DISPLAY_OPT="$DEFAULT_DISPLAY"
 SNAPSHOT_OPT=""
@@ -723,7 +687,8 @@ exec qemu-system-x86_64 \\
     \$SNAPSHOT_OPT \\
     $DRIVE_ARGS \\
     $CDROM_ARG \\
-    $NET_ARGS \\
+    -netdev bridge,id=net0,br=$SELECTED_BRIDGE,helper=$HELPER_BIN \\
+    -device virtio-net-pci,netdev=net0,mac=$RAND_MAC \\
     $PCAP_ARG \\
     -monitor unix:"$MONITOR_SOCKET",server,nowait \\
     -qmp unix:"$QMP_SOCKET",server,nowait \\
