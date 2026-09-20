@@ -17,6 +17,7 @@ CAPTURE_DIR="$CONFIG_DIR/captures"
 
 TMP_OVA_DIR=""
 
+
 # ==============================================================================
 # Variables de Color y Estado
 # ==============================================================================
@@ -36,7 +37,7 @@ CIAN_BRILLANTE="\e[1;36m"
 ROJO="\e[31m"
 ROJO_BRILLANTE="\e[1;31m"
 
-VER="v2.6"
+VER="v 3.2" #funcion para los menus fzf
 
 # Guardián contra ejecución innecesaria con 'sudo'
 check_sudo_usage() {
@@ -61,6 +62,21 @@ cleanup() {
     [[ -n "$TMP_OVA_DIR" && -d "$TMP_OVA_DIR" ]] && rm -rf "$TMP_OVA_DIR"
 }
 trap 'cleanup' EXIT
+
+# ==============================================================================
+# Función Genérica de Menú / Selector mediante FZF
+# ==============================================================================
+menu_fzf() {
+    local input_data="$1"
+    shift
+    echo -e "$input_data" | fzf \
+        --reverse \
+        --height=60% \
+        --border \
+        --preview-window=right:50%:wrap \
+        "$@"
+}
+
 
 # Genera el texto del logo (sin ejecutar 'clear' para permitir integrarse en FZF)
 get_logo_text() {
@@ -120,8 +136,17 @@ get_logo_text() {
 
 show_logo() {
     clear
+    local logo_raw="--- ⚡ QEMU4ME | PENTEST VM MANAGER | ${VER}:$(date +"%H:%M:%S"): ⚡---"
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 80)
+    
+    local text_len=${#logo_raw}
+    local padding=$(( (term_width - text_len) / 2 ))
+    (( padding < 0 )) && padding=0
+
+    printf "%*s" "$padding" ""
     get_logo_text
-    echo ""
+    echo -e "\n"
 }
 
 sanitize_name() {
@@ -135,9 +160,9 @@ confirm_action() {
     
     local choice
     if [[ "$default_choice" == "Sí" ]]; then
-        choice=$(echo -e "Sí\nNo" | fzf --prompt="$prompt_msg: " --height=20% --reverse)
+        choice=$(menu_fzf "Sí\nNo" --prompt="$prompt_msg: " --height=20% --reverse)
     else
-        choice=$(echo -e "No\nSí" | fzf --prompt="$prompt_msg: " --height=20% --reverse)
+        choice=$(menu_fzf "No\nSí" --prompt="$prompt_msg: " --height=20% --reverse)
     fi
 
     [[ "$choice" == "Sí" ]]
@@ -439,7 +464,7 @@ get_vm_ip_address() {
 
 select_ram() {
     local CHOICE
-    CHOICE=$(echo -e "1024 MB (1GB)\n2048 MB (2GB)\n4096 MB (4GB)\n8192 MB (8GB)\nPersonalizado..." | fzf \
+    CHOICE=$(menu_fzf "1024 MB (1GB)\n2048 MB (2GB)\n4096 MB (4GB)\n8192 MB (8GB)\nPersonalizado..." \
         --prompt="Seleccione Memoria RAM: " \
         --preview='case {} in
             *"1024"*) echo -e "1024 MB (1GB):\n - Recomendado para distribuciones muy ligeras, routers o sistemas CLI." ;;
@@ -464,7 +489,7 @@ select_ram() {
 
 select_cpus() {
     local CHOICE
-    CHOICE=$(echo -e "1 CPU\n2 CPUs\n4 CPUs\n8 CPUs\nPersonalizado..." | fzf \
+    CHOICE=$(menu_fzf "1 CPU\n2 CPUs\n4 CPUs\n8 CPUs\nPersonalizado..." \
         --prompt="Seleccione vCPUs: " \
         --preview='case {} in
             *"1 CPU"*) echo -e "1 vCPU:\n - Rendimiento básico para máquinas livianas o de prueba." ;;
@@ -489,7 +514,7 @@ select_cpus() {
 
 select_disk_size() {
     local CHOICE
-    CHOICE=$(echo -e "10 GB (Ligero)\n20 GB (Estándar)\n40 GB (Medio)\n80 GB (Grande)\nPersonalizado..." | fzf \
+    CHOICE=$(menu_fzf "10 GB (Ligero)\n20 GB (Estándar)\n40 GB (Medio)\n80 GB (Grande)\nPersonalizado..." \
         --prompt="Seleccione Tamaño de Disco QCOW2: " \
         --preview='case {} in
             *"10 GB"*) echo -e "10 GB:\n - Tamaño compacto para instalaciones mínimas." ;;
@@ -570,7 +595,7 @@ create_vm() {
         return
     fi
 
-    IMAGE_PATH=$(echo "$raw_images" | fzf \
+    IMAGE_PATH=$(menu_fzf "$raw_images" \
         --prompt="Selecciona ISO u OVA: " \
         --preview='file {} 2>/dev/null; echo "-------------------"; ls -lh {} 2>/dev/null' \
         --preview-window=right:50%:wrap)
@@ -639,7 +664,7 @@ create_vm() {
 
     configure_network
 
-    DISPLAY_CHOICE=$(echo -e "Default GTK/SDL GUI (-display default)\nHeadless / Sin GUI (-display none)\nVNC Server :1 (-vnc :1)" | fzf \
+    DISPLAY_CHOICE=$(menu_fzf "Default GTK/SDL GUI (-display default)\nHeadless / Sin GUI (-display none)\nVNC Server :1 (-vnc :1)" \
         --prompt="Modo de Pantalla: " \
         --preview='case {} in
             *"Default"*) echo -e "Interfaz Gráfica Nativa:\n - Muestra la ventana de la VM directamente usando el gestor gráfico del sistema." ;;
@@ -756,7 +781,7 @@ show_vm_header() {
     local script_path="$VM_CONFIG_DIR/${vm_name}.sh"
     local monitor_socket="$QMP_DIR/${vm_name}-monitor.sock"
 
-    echo -e "\e[34m====================================================================\e[0m"
+    echo -e "\e[34m==========================================================\e[0m"
     echo -e "\e[1m  VM SELECCIONADA: \e[33m$vm_name\e[0m"
     
     local mac
@@ -784,7 +809,7 @@ show_vm_header() {
     echo -e "  ├─ Hostfwd Activos: $hostfwd"
     echo -e "  ├─ Tamaño Disco Principal: $disk_size"
     echo -e "  └─ Monitor QEMU: $status_socket"
-    echo -e "\e[34m====================================================================\e[0m\n"
+    echo -e "\e[34m==========================================================\e[0m\n"
 }
 
 qmp_control_menu() {
@@ -801,7 +826,7 @@ qmp_control_menu() {
         show_logo
         show_vm_header "$vm_name"
         echo -e "\e[33m--- Control Monitor QEMU (QMP) ---\e[0m\n"
-        CMD_CHOICE=$(echo -e "1. Pausar VM (stop)\n2. Reanudar VM (cont)\n3. Reiniciar (system_reset)\n4. Memory Dump\n5. Consola Interactiva\n6. Volver" | fzf \
+        CMD_CHOICE=$(menu_fzf "1. Pausar VM (stop)\n2. Reanudar VM (cont)\n3. Reiniciar (system_reset)\n4. Memory Dump\n5. Consola Interactiva\n6. Volver" \
             --prompt="Comando: " \
             --preview='case {} in
                 1*) echo -e "Pausar VM (stop):\n - Detiene la ejecución del procesador en tiempo real." ;;
@@ -862,10 +887,10 @@ quick_access_menu() {
     cmds+=("$script_path")
 
     local CHOICE
-    CHOICE=$(printf "%s\n" "${labels[@]}" | fzf \
+    CHOICE=$(menu_fzf "$(printf "%s\n" "${labels[@]}")" \
         --prompt="Selecciona Acción: " \
         --preview='echo -e "ACCION DE PORTAPAPELES:\n---------------------\nCopia la cadena exacta de ejecución o conexión al portapapeles."' \
-        --preview-window=right:50%:wrap)
+        --preview-window=right:40%:wrap)
     [[ -z "$CHOICE" ]] && return
 
     for idx in "${!labels[@]}"; do
@@ -924,13 +949,13 @@ clone_vm() {
         return
     fi
 
-    SRC_VM=$(printf "%s\n" "${VMS[@]}" | fzf \
+    SRC_VM=$(menu_fzf "$(printf "%s\n" "${VMS[@]}")" \
         --prompt="Selecciona VM Origen: " \
         --preview='vm="{}"
                    echo -e "DETALLES DE VM BASE:\n--------------------\nNombre: $vm"
                    echo ""
                    cat "'"$VM_CONFIG_DIR"'/$vm.sh" 2>/dev/null' \
-        --preview-window=right:50%:wrap)
+        --preview-window=right:40%:wrap)
     [[ -z "$SRC_VM" ]] && return
 
     SRC_DISK="$VM_STORAGE_DIR/${SRC_VM}.qcow2"
@@ -972,14 +997,14 @@ attach_resources() {
     show_logo
     show_vm_header "$vm_name"
     echo -e "\e[33m--- Gestión de Recursos (Discos e ISOs) ---\e[0m\n"
-    RESOURCE_ACTION=$(echo -e "1. Adjuntar Disco Secundario QCOW2\n2. Adjuntar CD-ROM / ISO\n3. Volver" | fzf \
+    RESOURCE_ACTION=$(menu_fzf "1. Adjuntar Disco Secundario QCOW2\n2. Adjuntar CD-ROM / ISO\n3. Volver" \
         --prompt="Acción: " \
         --preview='case {} in
             1*) echo -e "Adjuntar Disco Secundario QCOW2:\n - Crea y conecta un disco nuevo para almacenamiento independiente." ;;
             2*) echo -e "Adjuntar CD-ROM / ISO:\n - Asocia una imagen ISO como lectora de CD-ROM adicional." ;;
             3*) echo -e "Volver:\n - Regresa al menú anterior." ;;
         esac' \
-        --preview-window=right:50%:wrap)
+        --preview-window=right:40%:wrap)
 
     case "$RESOURCE_ACTION" in
         1*)
@@ -994,10 +1019,10 @@ attach_resources() {
             read -rp "Presiona Enter..."
             ;;
         2*)
-            ISO_PATH=$(find_images | fzf \
+            ISO_PATH=$(menu_fzf "$(find_images)" \
                 --prompt="Selecciona ISO Secundaria: " \
                 --preview='file {} 2>/dev/null; echo "-------------------"; ls -lh {} 2>/dev/null' \
-                --preview-window=right:50%:wrap)
+                --preview-window=right:40%:wrap)
             if [[ -n "$ISO_PATH" ]]; then
                 sed -i "/exec qemu-system-x86_64/a \    -drive file=\"$ISO_PATH\",media=cdrom \\\\" "$script_path"
                 echo -e "\e[32m[✓] ISO vinculada como CD-ROM.\e[0m"
@@ -1023,7 +1048,7 @@ manage_snapshots() {
         show_vm_header "$vm_name"
         echo -e "\e[33m--- Gestión de Snapshots ---\e[0m\n"
         
-        SNAP_ACTION=$(echo -e "1. Crear Snapshot\n2. Listar Snapshots\n3. Restaurar Snapshot\n4. Eliminar Snapshot\n5. Volver" | fzf \
+        SNAP_ACTION=$(menu_fzf "1. Crear Snapshot\n2. Listar Snapshots\n3. Restaurar Snapshot\n4. Eliminar Snapshot\n5. Volver" \
             --prompt="Acción: " \
             --preview='case {} in
                 1*) echo -e "Crear Snapshot:\n - Guarda un punto de restauración exacto del disco en su estado actual." ;;
@@ -1032,7 +1057,7 @@ manage_snapshots() {
                 4*) echo -e "Eliminar Snapshot:\n - Borra permanentemente una instantánea del disco." ;;
                 5*) echo -e "Volver:\n - Regresa al menú anterior." ;;
             esac' \
-            --preview-window=right:50%:wrap)
+            --preview-window=right:40%:wrap)
 
         case "$SNAP_ACTION" in
             1*)
@@ -1054,7 +1079,7 @@ manage_snapshots() {
                 if [ ${#SNAPS[@]} -eq 0 ]; then
                     echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
                 else
-                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Restaurar: ")
+                    TARGET_SNAP=$(menu_fzf "$(printf "%s\n" "${SNAPS[@]}")" --prompt="Restaurar: ")
                     if [[ -n "$TARGET_SNAP" ]]; then
                         qemu-img snapshot -a "$TARGET_SNAP" "$primary_disk"
                         echo -e "\e[32m[✓] Snapshot restaurado.\e[0m"
@@ -1067,7 +1092,7 @@ manage_snapshots() {
                 if [ ${#SNAPS[@]} -eq 0 ]; then
                     echo -e "\e[31m[!] No hay snapshots disponibles.\e[0m"
                 else
-                    TARGET_SNAP=$(printf "%s\n" "${SNAPS[@]}" | fzf --prompt="Eliminar: ")
+                    TARGET_SNAP=$(menu_fzf "$(printf "%s\n" "${SNAPS[@]}")" --prompt="Eliminar: ")
                     if [[ -n "$TARGET_SNAP" ]]; then
                         qemu-img snapshot -d "$TARGET_SNAP" "$primary_disk"
                         echo -e "\e[31m[✓] Snapshot eliminado.\e[0m"
@@ -1095,31 +1120,29 @@ manage_vms() {
         return
     fi
 
-    SELECTED_VM=$(printf "%s\n" "${VMS[@]}" | fzf \
+    SELECTED_VM=$(menu_fzf "$(printf "%s\n" "${VMS[@]}")" \
         --prompt="Selecciona una VM: " \
-        --preview='vm="{}"
-                   echo -e "INFORMACIÓN DE MÁQUINA VIRTUAL:\n--------------------------------"
-                   echo "Nombre: $vm"
-                   echo ""
-                   if [[ -f "'"$VM_STORAGE_DIR"'/$vm.qcow2" ]]; then
-                       echo "Tamaño de Disco: $(du -sh "'"$VM_STORAGE_DIR"'/$vm.qcow2" | cut -f1)"
-                   fi
-                   if pgrep -f "qemu-system-x86_64.*-name $vm" >/dev/null; then
-                       echo "Estado: ACTIVA (PID: $(pgrep -f "qemu.*-name $vm" | head -1))"
-                   else
-                       echo "Estado: INACTIVA"
-                   fi
-                   echo ""
-                   echo "Script de configuración:"
-                   cat "'"$VM_CONFIG_DIR"'/$vm.sh" 2>/dev/null' \
-        --preview-window=right:50%:wrap)
+        --preview='
+            vm={};
+            echo "INFORMACIÓN DE VM";
+            echo "-------------------";
+            echo "Nombre: $vm";
+            echo "";
+            if test -S "'"$QMP_DIR"'/"$vm"-monitor.sock"; then
+                echo "Estado: ACTIVA";
+            else
+                echo "Estado: INACTIVA";
+            fi
+        ' \
+        --preview-window=right:40%:wrap)
+
     [[ -z "$SELECTED_VM" ]] && return
 
     while true; do
         show_logo
         show_vm_header "$SELECTED_VM"
 
-        ACTION=$(echo -e "Arrancar (GUI)\nArrancar Sandbox / Read-Only (-snapshot)\nArrancar (VNC Server :1)\nArrancar (Headless / Sin GUI)\nAcceso Rápido / Copiar Comandos\nControl QMP / Monitor\nGestionar Snapshots\nAdjuntar Discos/ISOs\nExportar Bundle (.tar.gz)\nApagar Forzado (Kill)\nEliminar VM (Script + Discos)\nVolver" | fzf \
+        ACTION=$(menu_fzf "Arrancar (GUI)\nArrancar Sandbox / Read-Only (-snapshot)\nArrancar (VNC Server :1)\nArrancar (Headless / Sin GUI)\nAcceso Rápido / Copiar Comandos\nControl QMP / Monitor\nGestionar Snapshots\nAdjuntar Discos/ISOs\nExportar Bundle (.tar.gz)\nApagar Forzado (Kill)\nEliminar VM (Script + Discos)\nVolver" \
             --prompt="Acción [$SELECTED_VM]: " \
             --preview='case {} in
                 *"GUI") echo -e "Arrancar (GUI):\n - Abre la máquina virtual con ventana gráfica local." ;;
@@ -1135,7 +1158,7 @@ manage_vms() {
                 *"Eliminar"*) echo -e "Eliminar VM:\n - Borra de forma irreversible la VM, su script y todos sus discos." ;;
                 *) echo -e "Volver:\n - Regresa al menú principal." ;;
             esac' \
-            --preview-window=right:50%:wrap)
+            --preview-window=right:40%:wrap)
 
         case "$ACTION" in
             *"Arrancar (GUI)"*)       launch_vm "$SELECTED_VM" --gui ;;
@@ -1175,9 +1198,7 @@ manage_vms() {
 main_menu() {
     check_and_install_dependencies
     while true; do
-        clear
-        local logo_header
-        logo_header=$(get_logo_text)
+        show_logo
 
         local options=(
             "1. Crear VM Vulnerable"
@@ -1187,21 +1208,16 @@ main_menu() {
             "5. Salir"
         )
 
-        MENU_OPTION=$(printf "%s\n" "${options[@]}" | fzf \
+        MENU_OPTION=$(menu_fzf "$(printf "%s\n" "${options[@]}")" \
             --ansi \
-            --header="$logo_header" \
             --prompt="Selecciona una acción: " \
-            --reverse \
-            --height=100% \
-            --border \
             --preview='case {} in
                 1*) echo -e "DETALLES DE LA OPCIÓN:\n--------------------\nCrear VM Vulnerable:\n - Despliega una nueva máquina a partir de imágenes ISO u OVA descargadas." ;;
                 2*) echo -e "DETALLES DE LA OPCIÓN:\n--------------------\nGestionar / Listar VMs:\n - Arranca, detén, apaga, elimina o administra el estado de tus VMs." ;;
                 3*) echo -e "DETALLES DE LA OPCIÓN:\n--------------------\nClonación Rápida (Linked):\n - Crea un clon liviano e instantáneo vinculado a un disco base existente." ;;
                 4*) echo -e "DETALLES DE LA OPCIÓN:\n--------------------\nImportar Bundle (.tar.gz):\n - Restaura y registra una máquina virtual exportada previamente." ;;
                 5*) echo -e "DETALLES DE LA OPCIÓN:\n--------------------\nSalir:\n - Cierra el gestor QEMU4ME." ;;
-            esac' \
-            --preview-window=right:50%:wrap)
+            esac')
 
         case "$MENU_OPTION" in
             1*) create_vm ;;
