@@ -36,7 +36,7 @@ CIAN_BRILLANTE="\e[1;36m"
 ROJO="\e[31m"
 ROJO_BRILLANTE="\e[1;31m"
 
-VER="v 3"
+VER="v2.6"
 
 # Guardián contra ejecución innecesaria con 'sudo'
 check_sudo_usage() {
