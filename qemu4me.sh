@@ -323,6 +323,12 @@ check_and_install_dependencies() {
         echo "allow all" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
     fi
 
+    if [[ -f /etc/qemu/bridge.conf ]]; then
+        if ! grep -q "allow virbr0" /etc/qemu/bridge.conf; then
+            echo "allow virbr0" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
+        fi
+    fi
+
     local HELPER_BIN
     HELPER_BIN=$(which qemu-bridge-helper 2>/dev/null || find /usr -name qemu-bridge-helper 2>/dev/null | head -n1)
 
@@ -339,6 +345,33 @@ check_and_install_dependencies() {
         echo -e "\e[34m[+] Cargando módulos KVM...\e[0m"
         sudo modprobe kvm 2>/dev/null || true
         sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
+    fi
+
+    # ==============================================================================
+    # Configuración e inicio de Libvirt / Virt-Manager (virbr0)
+    # ==============================================================================
+    echo -e "\e[34m[+] Verificando y activando servicios de Virt-Manager (libvirt)..."
+
+    # 1. Asegurar que el servicio libvirtd esté activo y habilitado
+    if ! systemctl is-active --quiet libvirtd; then
+        echo -e "\e[33m[!] Activando servicio libvirtd..."
+        sudo systemctl enable --now libvirtd.service
+    fi
+
+    # 2. Asegurar que la red 'default' (virbr0) de libvirt esté iniciada y en autostart
+    if command -v virsh &>/dev/null; then
+        sudo virsh net-autostart default 2>/dev/null || true
+        if ! sudo virsh net-info default 2>/dev/null | grep -q "Active:.*yes"; then
+            echo -e "\e[33m[!] Iniciando red 'default' (virbr0) de libvirt..."
+            sudo virsh net-start default 2>/dev/null || true
+        fi
+    fi
+
+    # 3. Permitir que QEMU (sin root) use la interfaz virbr0
+    sudo mkdir -p /etc/qemu
+    if ! grep -q "allow virbr0" /etc/qemu/bridge.conf 2>/dev/null; then
+        echo "allow virbr0" | sudo tee -a /etc/qemu/bridge.conf >/dev/null
+        sudo chmod 640 /etc/qemu/bridge.conf
     fi
 
     echo -e "\e[32m[✓] Entorno del sistema verificado y preparado correctamente.\e[0m\n"
@@ -358,6 +391,23 @@ setup_lab_bridge() {
         sudo ip link add name "$bridge_name" type bridge
         sudo ip addr add "$bridge_ip" dev "$bridge_name"
         sudo ip link set dev "$bridge_name" up
+    fi
+
+    # Habilitar NAT/IP Forwarding para que las VMs tengan salida a internet a través del host
+    sudo sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+    
+    local default_interface
+    default_interface=$(ip route show default | awk '/default/ {print $5}' | head -n1)
+    
+    if [[ -n "$default_interface" ]]; then
+        sudo iptables -t nat -C POSTROUTING -s "${bridge_ip%.*}.0/24" -o "$default_interface" -j MASQUERADE 2>/dev/null || \
+        sudo iptables -t nat -A POSTROUTING -s "${bridge_ip%.*}.0/24" -o "$default_interface" -j MASQUERADE
+        
+        sudo iptables -C FORWARD -i "$bridge_name" -o "$default_interface" -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$bridge_name" -o "$default_interface" -j ACCEPT
+        
+        sudo iptables -C FORWARD -i "$default_interface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        sudo iptables -A FORWARD -i "$default_interface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT
     fi
 
     if command -v dnsmasq &>/dev/null; then
@@ -380,30 +430,15 @@ get_vm_ip_address() {
 
     local mac_lower
     mac_lower=$(echo "$mac_addr" | tr '[:upper:]' '[:lower:]')
-    local ip_found=""
 
-    ip_found=$(ip neighbor show | grep -i "$mac_lower" | awk '{print $1}' | head -n1)
-
-    if [[ -z "$ip_found" ]]; then
-        local lease_files=(
-            /var/lib/misc/dnsmasq.leases
-            /var/lib/dhcp/dhcpd.leases
-            /var/lib/NetworkManager/*.lease
-            /var/lib/systemd/network/*.lease
-            /tmp/dnsmasq*.leases
-        )
-        for lf in "${lease_files[@]}"; do
-            if [[ -f "$lf" ]]; then
-                ip_found=$(grep -i "$mac_lower" "$lf" 2>/dev/null | awk '{print $3}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
-                [[ -n "$ip_found" ]] && break
-            fi
-        done
-    fi
+    # Consulta directa al servicio leases de libvirt/Virt-Manager
+    local ip_found
+    ip_found=$(virsh net-dhcp-leases default 2>/dev/null | grep -i "$mac_lower" | awk '{print $5}' | cut -d'/' -f1 | head -n1)
 
     if [[ -n "$ip_found" ]]; then
         echo "$ip_found"
     else
-        echo "No detectada (Offline/Buscando...)"
+        echo "No detectada (Buscando IP en virbr0...)"
     fi
 }
 
@@ -483,37 +518,18 @@ select_disk_size() {
 }
 
 configure_network() {
-    echo -e "\n\e[34m[+] Modo de red:\e[0m"
-    NET_MODE=$(echo -e "1. Bridge Aislado br-lab (Wi-Fi)\n2. Bridge Existente\n3. User/NAT + hostfwd" \
-               | fzf --prompt="Red: " \
-               --preview='case {} in
-                   1*) echo -e "Bridge Aislado (br-lab):\n - Crea un puente aislado con DHCP propio (192.168.100.x).\n - Ideal para entornos Wi-Fi o laboratorios totalmente aislados." ;;
-                   2*) echo -e "Bridge Existente:\n - Asocia la máquina a una interfaz bridge previamente creada en el host." ;;
-                   3*) echo -e "User/NAT + hostfwd:\n - Utiliza la red de usuario nativa de QEMU con reenvío de puertos configurables (ej. 2222->22)." ;;
-               esac' \
-               --preview-window=right:50%:wrap)
+    echo -e "\n\e[34m[+] Asignando red a la interfaz virbr0 de Virt-Manager...\e[0m"
+
+    # Verificar que virbr0 existe y la red 'default' de libvirt está activa
+    if ! ip link show dev virbr0 &>/dev/null; then
+        echo -e "\e[33m[!] Activando red 'default' de Virt-Manager...\e[0m"
+        sudo virsh net-start default 2>/dev/null || true
+    fi
 
     RAND_MAC=$(printf '52:54:00:%02X:%02X:%02X' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
-
-    if [[ "$NET_MODE" =~ Aislado ]]; then
-        SELECTED_BRIDGE=$(setup_lab_bridge)
-        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
-    elif [[ "$NET_MODE" =~ Existente ]]; then
-        BRIDGES=$(get_bridge_interfaces)
-        SELECTED_BRIDGE=$(echo "$BRIDGES" | fzf --prompt="Bridge: ")
-        [[ -z "$SELECTED_BRIDGE" ]] && SELECTED_BRIDGE="br-lab"
-        SELECTED_BRIDGE=$(sanitize_name "$SELECTED_BRIDGE")
-        NET_ARGS="-netdev bridge,id=net0,br=$SELECTED_BRIDGE -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
-    else
-        read -rp "--> hostfwd (ej: tcp::2222-:22): " FWD_RULES
-        local fwd=""
-        if [[ -n "$FWD_RULES" ]]; then
-            FWD_RULES=$(echo "$FWD_RULES" | tr -cd 'a-zA-Z0-9_,-:')
-            IFS=',' read -ra ADDR <<< "$FWD_RULES"
-            for i in "${ADDR[@]}"; do fwd+=",hostfwd=$i"; done
-        fi
-        NET_ARGS="-netdev user,id=net0${fwd} -device virtio-net-pci,netdev=net0,mac=$RAND_MAC"
-    fi
+    
+    # Usamos virbr0 directamente con el helper de QEMU
+    SELECTED_BRIDGE="virbr0"
 }
 
 launch_vm() {
