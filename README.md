@@ -3,7 +3,7 @@
 # ⚡ QEMU4ME - Gestor Ultraligero de VMs para Pentesting
 
 [![Version](https://img.shields.io/badge/version-3.2-blue)](https://github.com/DanSanMar/qemu4me)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![License](https://img.shields.io/badge/license-GPLv3-blue)
 [![Platform](https://img.shields.io/badge/platform-Linux-orange)](https://www.linux.org/)
 [![Shell](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 
