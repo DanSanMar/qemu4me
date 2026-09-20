@@ -1,0 +1,125 @@
+# ==============================================================================
+#  QEMU4ME - .gitignore
+#  Parte de la suite ALL4ME | Autor: DanSanMar
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+#  Almacenamiento de VMs (NUNCA subir discos ni configuraciones locales)
+# ------------------------------------------------------------------------------
+*.qcow2
+*.qcow
+*.raw
+*.vmdk
+*.vdi
+*.vhd
+*.vhdx
+*.img
+*.ova
+*.ovf
+
+# Directorios típicos de QEMU4ME (por si se copian al repo)
+/config/
+/disks/
+/vms/
+/qmp/
+/pids/
+/captures/
+*.log
+*.sock
+*.lock
+
+# ------------------------------------------------------------------------------
+#  Imágenes y paquetes de VMs
+# ------------------------------------------------------------------------------
+*.iso
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.zip
+*_bundle.tar.gz
+
+# Dumps de memoria (forense)
+*.raw.dump
+*.memdump
+*.dmp
+
+# Capturas de red
+*.pcap
+*.pcapng
+*.cap
+
+# ------------------------------------------------------------------------------
+#  Archivos de sistema / editor
+# ------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# IDEs y editores
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# ------------------------------------------------------------------------------
+#  Entornos y dependencias (por si se añaden scripts auxiliares)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+node_modules/
+package-lock.json
+
+# ------------------------------------------------------------------------------
+#  Logs y salidas temporales
+# ------------------------------------------------------------------------------
+*.out
+*.err
+logs/
+tmp/
+temp/
+*.pid
+
+# ------------------------------------------------------------------------------
+#  Backups locales
+# ------------------------------------------------------------------------------
+*.backup
+*.old
+*_backup/
+backup/
+
+# ------------------------------------------------------------------------------
+#  Secretos / credenciales (por seguridad)
+# ------------------------------------------------------------------------------
+secrets/
+*.key
+*.pem
+*.crt
+id_rsa*
+id_ed25519*
+*.password
+*.secret
+credentials.*
+
+# ------------------------------------------------------------------------------
+#  Excepciones (archivos que SÍ queremos versionar)
+# ------------------------------------------------------------------------------
+!.gitignore
+!README.md
+!LICENSE
+!qemu4me.sh
+!*.md
+!.env.example
